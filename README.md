@@ -9,6 +9,6 @@ A desktop electronic circuit simulator built in C++[cite: 1], inspired by Proteu
 * **Save/Load:** Custom file management for circuit states[cite: 1].
 
 ## 🛠️ Tech Stack
-* **Language:** C++[cite: 1]
-* **Graphics:** Qt / SDL2[cite: 1] (TBD)
+* **Language:** C++
+* **Graphics:** Qt / SDL2
 * **Build:** CMake
