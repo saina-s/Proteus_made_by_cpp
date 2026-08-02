@@ -1,11 +1,11 @@
 # Proteus Simulator ⚡
 
-A desktop electronic circuit simulator built in C++[cite: 1], inspired by Proteus[cite: 1]. This is the final Object-Oriented Programming project for Sharif University of Technology (Spring 2026)[cite: 1].
+A desktop electronic circuit simulator built in C++[cite: 1], inspired by Proteus[cite: 1]. This is the final Object-Oriented Programming project for Sharif University of Technology (Spring 2026).
 
 ## 🚀 Features
-* **Interactive Canvas:** Grid snapping, drag-and-drop, and 90-degree smart wiring[cite: 1].
-* **Components:** Basic elements (R, L, C, GND), logic gates, and MCU simulation[cite: 1].
-* **Live Simulation:** Run/pause modes with real-time visual feedback and measurement tools (Oscilloscope, Voltmeter)[cite: 1].
+* **Interactive Canvas:** Grid snapping, drag-and-drop, and 90-degree smart wiring.
+* **Components:** Basic elements (R, L, C, GND), logic gates, and MCU simulation.
+* **Live Simulation:** Run/pause modes with real-time visual feedback and measurement tools (Oscilloscope, Voltmeter).
 * **Save/Load:** Custom file management for circuit states[cite: 1].
 
 ## 🛠️ Tech Stack
