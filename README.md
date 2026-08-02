@@ -6,7 +6,7 @@ A desktop electronic circuit simulator built in C++[cite: 1], inspired by Proteu
 * **Interactive Canvas:** Grid snapping, drag-and-drop, and 90-degree smart wiring.
 * **Components:** Basic elements (R, L, C, GND), logic gates, and MCU simulation.
 * **Live Simulation:** Run/pause modes with real-time visual feedback and measurement tools (Oscilloscope, Voltmeter).
-* **Save/Load:** Custom file management for circuit states[cite: 1].
+* **Save/Load:** Custom file management for circuit states.
 
 ## 🛠️ Tech Stack
 * **Language:** C++
