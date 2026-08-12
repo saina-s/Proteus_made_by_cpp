@@ -720,3 +720,484 @@ public:
     std::vector<NetNode> nets_;
 };
 
+class GenericComponent : public Component {
+public:
+    GenericComponent(std::string typeName, ComponentCategory category)
+        : Component(std::move(typeName), category) {
+    }
+    void draw(CanvasPainter& painter, bool selected) const override;
+};
+
+// Source components
+class Ground final : public GenericComponent {
+public:
+    Ground() : GenericComponent("Ground", ComponentCategory::Sources) {
+        setLabel("GND");
+        addPin("GND", PinType::Ground, { 0, -20 });
+        updatePinWorldPositions();
+    }
+    RectD localBounds() const override { return { -18, -24, 36, 40 }; }
+};
+
+class DCVoltageSource : public GenericComponent {
+public:
+    DCVoltageSource() : GenericComponent("DCVoltageSource", ComponentCategory::Sources) {
+        setLabel("V?");
+        addPin("POS", PinType::Power, { 0, -32 });
+        addPin("NEG", PinType::Passive, { 0, 32 });
+        updatePinWorldPositions();
+    }
+    double voltage() const { return voltage_; }
+    RectD localBounds() const override { return { -24, -36, 48, 72 }; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"voltage", "Voltage (V)", formatDouble(voltage_), false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "voltage") { voltage_ = std::stod(value); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["voltage"] = formatDouble(voltage_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("voltage"); it != s.end()) voltage_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(voltage_) + " V"; }
+protected:
+    double voltage_{ 5.0 };
+};
+
+class Battery final : public DCVoltageSource {
+public:
+    Battery() : DCVoltageSource() {
+        type_ = "Battery";
+        category_ = ComponentCategory::Sources;
+        setLabel("BAT?");
+        voltage_ = 9.0;
+    }
+};
+
+class Resistor final : public GenericComponent {
+public:
+    Resistor() : GenericComponent("Resistor", ComponentCategory::Passive) {
+        setLabel("R?"); addPin("A", PinType::Passive, { -34, 0 }); addPin("B", PinType::Passive, { 34, 0 });
+        updatePinWorldPositions();
+    }
+    double resistance() const { return resistance_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"resistance", "Resistance (ohm)", formatDouble(resistance_), false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "resistance") {
+            const std::map<std::string, double> suffixes{ {"k", 1e3}, {"kohm", 1e3}, {"m", 1e6}, {"mohm", 1e6}, {"ohm", 1.0} };
+            resistance_ = std::max(1e-9, parseEngineering(value, resistance_, suffixes)); return true;
+        }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["resistance"] = formatDouble(resistance_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("resistance"); it != s.end()) resistance_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(resistance_) + " ohm"; }
+private:
+    double resistance_{ 1000.0 };
+};
+
+class Capacitor final : public GenericComponent {
+public:
+    Capacitor() : GenericComponent("Capacitor", ComponentCategory::Passive) {
+        setLabel("C?"); addPin("A", PinType::Passive, { -34, 0 }); addPin("B", PinType::Passive, { 34, 0 });
+        updatePinWorldPositions();
+    }
+    double capacitance() const { return capacitance_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"capacitance", "Capacitance (F/nF/uF)", formatDouble(capacitance_ * 1e9) + " nF", false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "capacitance") {
+            const std::map<std::string, double> suffixes{ {"f", 1.0}, {"mf", 1e-3}, {"uf", 1e-6}, {"nf", 1e-9}, {"pf", 1e-12} };
+            capacitance_ = std::max(0.0, parseEngineering(value, capacitance_, suffixes)); return true;
+        }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["capacitance"] = formatDouble(capacitance_, 14); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("capacitance"); it != s.end()) capacitance_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(capacitance_ * 1e9) + " nF"; }
+private:
+    double capacitance_{ 100e-9 };
+};
+
+class Inductor final : public GenericComponent {
+public:
+    Inductor() : GenericComponent("Inductor", ComponentCategory::Passive) {
+        setLabel("L?"); addPin("A", PinType::Passive, { -34, 0 }); addPin("B", PinType::Passive, { 34, 0 });
+        updatePinWorldPositions();
+    }
+    double inductance() const { return inductance_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"inductance", "Inductance (H/mH/uH)", formatDouble(inductance_ * 1e3) + " mH", false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "inductance") {
+            const std::map<std::string, double> suffixes{ {"h", 1.0}, {"mh", 1e-3}, {"uh", 1e-6}, {"nh", 1e-9} };
+            inductance_ = std::max(0.0, parseEngineering(value, inductance_, suffixes)); return true;
+        }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["inductance"] = formatDouble(inductance_, 14); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("inductance"); it != s.end()) inductance_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(inductance_ * 1e3) + " mH"; }
+private:
+    double inductance_{ 1e-3 };
+};
+class Potentiometer final : public GenericComponent {
+public:
+    Potentiometer() : GenericComponent("Potentiometer", ComponentCategory::Passive) {
+        setLabel("RV?");
+        addPin("A", PinType::Passive, { -36, 0 });
+        addPin("B", PinType::Passive, { 36, 0 });
+        addPin("W", PinType::Passive, { 0, -30 });
+        updatePinWorldPositions();
+    }
+    double resistance() const { return resistance_; }
+    double wiper() const { return wiper_; }
+    void adjustWiper(double delta) { wiper_ = clampValue(wiper_ + delta, 0.002, 0.998); }
+    RectD localBounds() const override { return { -40, -34, 80, 58 }; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"resistance", "Total resistance (ohm)", formatDouble(resistance_), false},
+                {"wiper", "Wiper (0..1)", formatDouble(wiper_), false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "resistance") { resistance_ = std::max(1.0, std::stod(value)); return true; }
+        if (key == "wiper") { wiper_ = clampValue(std::stod(value), 0.002, 0.998); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["resistance"] = formatDouble(resistance_, 12);
+        s["wiper"] = formatDouble(wiper_, 12);
+        return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("resistance"); it != s.end()) resistance_ = std::stod(it->second);
+        if (auto it = s.find("wiper"); it != s.end()) wiper_ = clampValue(std::stod(it->second), 0.002, 0.998);
+    }
+    std::string compactStatus() const override {
+        return formatDouble(resistance_) + " ohm, w=" + formatDouble(wiper_, 3);
+    }
+private:
+    double resistance_{ 10000.0 };
+    double wiper_{ 0.5 };
+};
+
+class Switch final : public GenericComponent {
+public:
+    Switch() : GenericComponent("Switch", ComponentCategory::Interactive) {
+        setLabel("SW?");
+        addPin("A", PinType::Passive, { -32, 0 });
+        addPin("B", PinType::Passive, { 32, 0 });
+        updatePinWorldPositions();
+    }
+    bool closed() const { return closed_; }
+    void toggle() { closed_ = !closed_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"closed", "Closed", closed_ ? "true" : "false", false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "closed") { closed_ = toLower(value) == "true" || value == "1"; return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["closed"] = closed_ ? "1" : "0";
+        return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("closed"); it != s.end()) closed_ = it->second == "1";
+    }
+    std::string compactStatus() const override { return closed_ ? "CLOSED" : "OPEN"; }
+private:
+    bool closed_{ false };
+};
+
+class PushButton final : public GenericComponent {
+public:
+    PushButton() : GenericComponent("PushButton", ComponentCategory::Interactive) {
+        setLabel("BTN?");
+        addPin("A", PinType::Passive, { -32, 0 });
+        addPin("B", PinType::Passive, { 32, 0 });
+        updatePinWorldPositions();
+    }
+    bool pressed() const { return pressed_; }
+    void setPressed(bool pressed) { pressed_ = pressed; }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["pressed"] = pressed_ ? "1" : "0";
+        return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("pressed"); it != s.end()) pressed_ = it->second == "1";
+    }
+    std::string compactStatus() const override { return pressed_ ? "PRESSED" : "RELEASED"; }
+private:
+    bool pressed_{ false };
+};
+
+class LED final : public GenericComponent {
+public:
+    LED() : GenericComponent("LED", ComponentCategory::Interactive) {
+        setLabel("D?");
+        addPin("A", PinType::Input, { -30, 0 });
+        addPin("K", PinType::Passive, { 30, 0 });
+        updatePinWorldPositions();
+    }
+    bool on() const { return on_; }
+    void setOn(bool on) { on_ = on; }
+    Color ledColor() const { return color_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        std::ostringstream c;
+        c << static_cast<int>(color_.r) << "," << static_cast<int>(color_.g) << "," << static_cast<int>(color_.b);
+        return { {"label", "Label", label_, false}, {"color", "Color R,G,B", c.str(), false},
+                {"on", "Current state", on_ ? "ON" : "OFF", true} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "color") {
+            int r = 255, g = 0, b = 0;
+            char comma;
+            std::istringstream in(value);
+            if (in >> r >> comma >> g >> comma >> b)
+                color_ = { static_cast<Uint8>(clampValue(r, 0, 255)), static_cast<Uint8>(clampValue(g, 0, 255)), static_cast<Uint8>(clampValue(b, 0, 255)), 255 };
+            return true;
+        }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["on"] = on_ ? "1" : "0";
+        s["r"] = std::to_string(color_.r);
+        s["g"] = std::to_string(color_.g);
+        s["b"] = std::to_string(color_.b);
+        return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("on"); it != s.end()) on_ = it->second == "1";
+        if (auto it = s.find("r"); it != s.end()) color_.r = static_cast<Uint8>(std::stoi(it->second));
+        if (auto it = s.find("g"); it != s.end()) color_.g = static_cast<Uint8>(std::stoi(it->second));
+        if (auto it = s.find("b"); it != s.end()) color_.b = static_cast<Uint8>(std::stoi(it->second));
+    }
+    std::string compactStatus() const override { return on_ ? "ON" : "OFF"; }
+private:
+    bool on_{ false };
+    Color color_{ 245, 45, 35, 255 };
+};
+
+class SevenSegment final : public GenericComponent {
+public:
+    SevenSegment() : GenericComponent("SevenSegment", ComponentCategory::Interactive) {
+        setLabel("7SEG?");
+        const std::array<const char*, 8> names{ {"A", "B", "C", "D", "E", "F", "G", "DP"} };
+        for (int i = 0; i < 8; ++i) addPin(names[i], PinType::Input, { -46 + i * 13.0, 38 });
+        addPin("COM", PinType::Passive, { 46, 0 });
+        updatePinWorldPositions();
+    }
+    void setMask(std::uint8_t mask) { mask_ = mask; }
+    std::uint8_t mask() const { return mask_; }
+    RectD localBounds() const override { return { -50, -42, 100, 84 }; }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["mask"] = std::to_string(mask_); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s); if (auto it = s.find("mask"); it != s.end()) mask_ = static_cast<std::uint8_t>(std::stoi(it->second));
+    }
+private:
+    std::uint8_t mask_{ 0x3F };
+};
+
+// Digital logic
+
+void GenericComponent::draw(CanvasPainter& painter, bool selected) const {
+    const Color stroke = selected ? Palette::Selection : Palette::DarkText;
+    const Color bodyFill{ 235, 238, 242, 255 };
+    auto P = [&](double x, double y) { return transformLocal({ x, y }); };
+    auto line = [&](double x1, double y1, double x2, double y2, Color c = Color{ 0, 0, 0, 0 }, int thickness = 2) {
+        if (c.a == 0) c = stroke;
+        painter.line(P(x1, y1), P(x2, y2), c, thickness);
+        };
+    auto circle = [&](double x, double y, double r, Color c, bool filled = false) { painter.circle(P(x, y), r, c, filled); };
+    auto localRect = [&](RectD r, Color c, bool filled = false, Color fill = {}) {
+        std::vector<Vec2> points{ P(r.left(), r.top()), P(r.right(), r.top()), P(r.right(), r.bottom()), P(r.left(), r.bottom()), P(r.left(), r.top()) };
+        if (filled) {
+            painter.rect(worldBounds(), c, true, fill);
+        }
+        painter.polyline(points, c, 2);
+        };
+    auto label = [&](const std::string& value, double x, double y, int size = 11, Color c = Color{ 0, 0, 0, 0 }) {
+        if (c.a == 0) c = stroke;
+        painter.textWorld(value, P(x, y), c, size, true);
+        };
+
+    if (type_ == "Ground") {
+        line(0, -20, 0, 0); line(-14, 0, 14, 0); line(-9, 5, 9, 5); line(-4, 10, 4, 10);
+    }
+    else if (type_ == "DCVoltageSource") {
+        line(0, -32, 0, -16); line(0, 16, 0, 32); circle(0, 0, 15, stroke, false); label("+", 0, -7, 11); label("-", 0, 8, 11);
+        label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
+    }
+    else if (type_ == "Battery") {
+        line(0, -32, 0, -12); line(0, 12, 0, 32); line(-13, -12, 13, -12); line(-8, -4, 8, -4, stroke, 3);
+        line(-13, 5, 13, 5); line(-8, 13, 8, 13, stroke, 3); label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
+    }
+
+
+    else if (type_ == "Resistor") {
+        line(-34, 0, -24, 0); line(24, 0, 34, 0);
+        std::vector<Vec2> zig{ P(-24, 0), P(-18, -9), P(-10, 9), P(-2, -9), P(6, 9), P(14, -9), P(24, 0) };
+        painter.polyline(zig, stroke, 2); label(label_, 0, -20, 10); label(compactStatus(), 0, 21, 8, Palette::Muted);
+    }
+    else if (type_ == "Capacitor") {
+        line(-34, 0, -7, 0); line(7, 0, 34, 0); line(-7, -13, -7, 13); line(7, -13, 7, 13); label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
+    }
+    else if (type_ == "Inductor") {
+        line(-34, 0, -22, 0); line(22, 0, 34, 0);
+        for (int i = 0; i < 4; ++i) {
+            const double cx = -16.5 + i * 11.0;
+            std::vector<Vec2> arc;
+            for (int k = 0; k <= 12; ++k) { const double a = kPi + kPi * k / 12.0; arc.push_back(P(cx + 5.5 * std::cos(a), 5.5 * std::sin(a))); }
+            painter.polyline(arc, stroke, 2);
+        }
+        label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
+    }
+    else if (type_ == "Potentiometer") {
+        line(-36, 0, -24, 0); line(24, 0, 36, 0); localRect({ -24, -8, 48, 16 }, stroke, true, bodyFill);
+        const auto* pot = dynamic_cast<const Potentiometer*>(this); const double wx = pot ? -20.0 + 40.0 * pot->wiper() : 0.0;
+        line(0, -30, wx, -9); line(wx, -9, wx - 4, -14); line(wx, -9, wx + 5, -12); label(label_, 0, 22, 10); label(compactStatus(), 0, 34, 8, Palette::Muted);
+    }
+    else if (type_ == "Switch" || type_ == "PushButton") {
+        const bool active = type_ == "Switch" ? dynamic_cast<const Switch*>(this)->closed() : dynamic_cast<const PushButton*>(this)->pressed();
+        line(-32, 0, -12, 0); line(12, 0, 32, 0); circle(-12, 0, 3, stroke, true); circle(12, 0, 3, stroke, true);
+        line(-12, 0, 12, active ? 0 : -14, active ? Palette::Accent2 : stroke, 3); label(label_, 0, -26, 10); label(compactStatus(), 0, 24, 8, active ? Palette::Accent2 : Palette::Muted);
+    }
+    else if (type_ == "LED") {
+        const auto* led = dynamic_cast<const LED*>(this); const Color lit = led && led->on() ? led->ledColor() : Color{ 100, 45, 45, 255 };
+        line(-30, 0, -13, 0); line(13, 0, 30, 0);
+        std::vector<Vec2> tri{ P(-13, -11), P(-13, 11), P(12, 0), P(-13, -11) }; painter.polyline(tri, stroke, 2); line(12, -11, 12, 11);
+        circle(0, 0, 9, lit, true); if (led && led->on()) { line(3, -13, 12, -22, lit, 2); line(9, -12, 18, -21, lit, 2); }
+        label(label_, 0, 24, 10); label(compactStatus(), 0, 35, 8, led && led->on() ? lit : Palette::Muted);
+    }
+    else if (type_ == "SevenSegment") {
+        const auto* display = dynamic_cast<const SevenSegment*>(this); const std::uint8_t mask = display ? display->mask() : 0;
+        localRect({ -42, -36, 84, 68 }, stroke, true, Color{ 45, 35, 35, 255 });
+        const Color on{ 250, 45, 35, 255 }, off{ 85, 35, 35, 255 };
+        auto seg = [&](int bit, double x1, double y1, double x2, double y2) { line(x1, y1, x2, y2, (mask & (1u << bit)) ? on : off, 5); };
+        seg(0, -20, -27, 20, -27); seg(1, 25, -23, 25, -2); seg(2, 25, 3, 25, 24); seg(3, -20, 28, 20, 28);
+        seg(4, -25, 3, -25, 24); seg(5, -25, -23, -25, -2); seg(6, -20, 0, 20, 0); circle(35, 27, 3, (mask & 0x80) ? on : off, true);
+        label(label_, 0, -48, 10);
+    }
+
+    else {
+        localRect(localBounds(), stroke, true, bodyFill); label(type_, 0, -5, 10); label(label_, 0, 10, 8, Palette::Muted);
+    }
+
+    if (selected) {
+        const RectD bounds = worldBounds();
+        painter.rect({ bounds.x - 4, bounds.y - 4, bounds.w + 8, bounds.h + 8 }, Palette::Selection, false);
+    }
+    drawPins(painter);
+}
+
+class ComponentFactory {
+public:
+    static ComponentFactory& instance() {
+        static ComponentFactory factory;
+        return factory;
+    }
+
+    std::shared_ptr<Component> create(const std::string& type) const {
+        auto it = creators_.find(type);
+        if (it != creators_.end()) {
+            return it->second();
+        }
+        return nullptr;
+    }
+
+private:
+    ComponentFactory() {
+        registerComponent<Ground>("Ground");
+        registerComponent<DCVoltageSource>("DCVoltageSource");
+        registerComponent<Battery>("Battery");
+        registerComponent<Resistor>("Resistor");
+        registerComponent<Capacitor>("Capacitor");
+        registerComponent<Inductor>("Inductor");
+        registerComponent<Potentiometer>("Potentiometer");
+        registerComponent<Switch>("Switch");
+        registerComponent<PushButton>("PushButton");
+        registerComponent<LED>("LED");
+        registerComponent<SevenSegment>("SevenSegment");
+    }
+
+    template<typename T>
+    void registerComponent(const std::string& name) {
+        creators_[name] = []() { return std::make_shared<T>(); };
+    }
+
+    std::unordered_map<std::string, std::function<std::shared_ptr<Component>()>> creators_;
+};
+
+static std::shared_ptr<Component> createComponentByType(const std::string& type) {
+    return ComponentFactory::instance().create(type);
+}
+
+struct LibraryEntry {
+    std::string type;
+    ComponentCategory category;
+    std::string description;
+};
+
+static const std::vector<LibraryEntry>& componentLibrary() {
+    static const std::vector<LibraryEntry> entries = {
+        {"Ground", ComponentCategory::Sources, "Global 0 V reference. At least one ground is required."},
+        {"DCVoltageSource", ComponentCategory::Sources, "Ideal adjustable DC source with POS and NEG terminals."},
+        {"Battery", ComponentCategory::Sources, "Battery-like DC source."},
+        {"Resistor", ComponentCategory::Passive, "Ohmic two-terminal resistor."},
+        {"Capacitor", ComponentCategory::Passive, "Backward-Euler dynamic capacitor."},
+        {"Inductor", ComponentCategory::Passive, "Backward-Euler dynamic inductor."},
+        {"Potentiometer", ComponentCategory::Passive, "Three-terminal adjustable resistor."},
+        {"Switch", ComponentCategory::Interactive, "Persistent open/closed interactive switch."},
+        {"PushButton", ComponentCategory::Interactive, "Momentary switch: active only while held."},
+        {"LED", ComponentCategory::Interactive, "Colored LED with threshold and visual state."},
+        {"SevenSegment", ComponentCategory::Interactive, "Seven-segment display with A-G, DP and COM pins."},
+    };
+    return entries;
+}
+
+
