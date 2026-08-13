@@ -1389,4 +1389,142 @@ void rerouteConnectedWires() {
     for (auto& wire : wires_) if (wire) wire->reroutePreservingWaypoints();
 }
 
+class Junction {
+public:
+    Junction() : id_(nextId_++) {}
+    explicit Junction(Vec2 position) : id_(nextId_++), position_(position) {}
+    JunctionId id() const { return id_; }
+    void setIdForLoad(JunctionId id) { id_ = id; nextId_ = std::max(nextId_, id_ + 1); }
+    Vec2 position() const { return position_; }
+    void setPosition(Vec2 p) { position_ = p; }
+    bool selected() const { return selected_; }
+    void setSelected(bool selected) { selected_ = selected; }
+    bool hitTest(Vec2 p) const { return distance(position_, p) <= 7.0; }
+private:
+    inline static JunctionId nextId_{ 1 };
+    JunctionId id_{ 0 };
+    Vec2 position_;
+    bool selected_{ false };
+};
+
+class NetNode {
+public:
+    explicit NetNode(int id = -1) : id_(id) {}
+
+    int id() const { return id_; }
+    const std::vector<std::shared_ptr<Pin>>& pins() const { return pins_; }
+    const std::vector<std::shared_ptr<Wire>>& wires() const { return wires_; }
+    const std::vector<std::shared_ptr<Junction>>& junctions() const { return junctions_; }
+
+    void addPin(const std::shared_ptr<Pin>& pin) {
+        if (pin) pins_.push_back(pin);
+    }
+
+    void addWire(const std::shared_ptr<Wire>& wire) {
+        if (wire) wires_.push_back(wire);
+    }
+
+    void addJunction(const std::shared_ptr<Junction>& junction) {
+        if (junction) junctions_.push_back(junction);
+    }
+
+    bool touches(Vec2 position, double tolerance = 2.0) const {
+        return std::any_of(wires_.begin(), wires_.end(), [&](const std::shared_ptr<Wire>& wire) {
+            return wire && wire->hitTest(position, tolerance);
+            });
+    }
+
+private:
+    int id_{ -1 };
+    std::vector<std::shared_ptr<Pin>> pins_;
+    std::vector<std::shared_ptr<Wire>> wires_;
+    std::vector<std::shared_ptr<Junction>> junctions_;
+};
+
+class DisjointSet {
+public:
+    explicit DisjointSet(int n = 0) { reset(n); }
+    void reset(int n) { parent_.resize(n); rank_.assign(n, 0); std::iota(parent_.begin(), parent_.end(), 0); }
+    int find(int x) { return parent_[x] == x ? x : parent_[x] = find(parent_[x]); }
+    void unite(int a, int b) {
+        a = find(a); b = find(b); if (a == b) return;
+        if (rank_[a] < rank_[b]) std::swap(a, b);
+        parent_[b] = a;
+        if (rank_[a] == rank_[b]) ++rank_[a];
+    }
+private:
+    std::vector<int> parent_;
+    std::vector<int> rank_;
+};
+
+    void addJunction(Vec2 position) {
+        position = snapToGrid(position);
+        for (const auto& junction : junctions_) if (junction && distance(junction->position(), position) < 1.0) return;
+        int touching = 0; for (const auto& wire : wires_) if (wire && wire->hitTest(position, 2.0)) ++touching;
+        if (touching >= 2) { junctions_.push_back(std::make_shared<Junction>(position)); modified_ = true; }
+    }
+
+    void removeJunction(JunctionId id) {
+        junctions_.erase(std::remove_if(junctions_.begin(), junctions_.end(), [id](const auto& j) { return !j || j->id() == id; }), junctions_.end());
+        modified_ = true;
+    }
+
+
+    std::shared_ptr<Junction> junctionAt(Vec2 world) const {
+        for (auto it = junctions_.rbegin(); it != junctions_.rend(); ++it) if (*it && (*it)->hitTest(world)) return *it;
+        return nullptr;
+    }
+
+    void buildNetlist() {
+        nets_.clear();
+        std::vector<std::shared_ptr<Pin>> allPins;
+        std::unordered_map<const Pin*, int> index;
+        for (const auto& component : components_) if (component) for (const auto& pin : component->pins()) if (pin) {
+            index[pin.get()] = static_cast<int>(allPins.size()); allPins.push_back(pin); pin->net = -1;
+        }
+        DisjointSet dsu(static_cast<int>(allPins.size()));
+        int firstGround = -1;
+        for (int i = 0; i < static_cast<int>(allPins.size()); ++i) if (allPins[i]->type == PinType::Ground) {
+            if (firstGround < 0) firstGround = i; else dsu.unite(firstGround, i);
+        }
+
+        for (const auto& wire : wires_) if (wire && wire->startPin() && wire->endPin()) {
+            auto a = index.find(wire->startPin().get()), b = index.find(wire->endPin().get()); if (a != index.end() && b != index.end()) dsu.unite(a->second, b->second);
+        }
+
+        for (const auto& junction : junctions_) if (junction) {
+            std::vector<std::shared_ptr<Wire>> touching;
+            for (const auto& wire : wires_) if (wire && wire->hitTest(junction->position(), 2.0)) touching.push_back(wire);
+            if (touching.size() >= 2) {
+                std::shared_ptr<Pin> anchor = touching.front()->startPin();
+                if (anchor) for (const auto& wire : touching) {
+                    if (wire->startPin()) dsu.unite(index[anchor.get()], index[wire->startPin().get()]);
+                    if (wire->endPin()) dsu.unite(index[anchor.get()], index[wire->endPin().get()]);
+                }
+            }
+        }
+
+        std::unordered_map<int, int> rootToNet;
+        for (int i = 0; i < static_cast<int>(allPins.size()); ++i) {
+            const int root = dsu.find(i);
+            if (!rootToNet.count(root)) { const int id = static_cast<int>(nets_.size()); rootToNet[root] = id; nets_.emplace_back(id); }
+            const int net = rootToNet[root]; allPins[i]->net = net; nets_[net].addPin(allPins[i]);
+        }
+        for (const auto& wire : wires_) if (wire && wire->startPin() && wire->startPin()->net >= 0) nets_[wire->startPin()->net].addWire(wire);
+        for (const auto& junction : junctions_) if (junction) {
+            for (auto& net : nets_) {
+                if (net.touches(junction->position(), 2.0)) { net.addJunction(junction); break; }
+            }
+        }
+    }
+
+private:
+    void pruneUnusedJunctions() {
+        junctions_.erase(std::remove_if(junctions_.begin(), junctions_.end(), [&](const auto& junction) {
+            if (!junction) return true;
+            int touching = 0;
+            for (const auto& wire : wires_) if (wire && wire->hitTest(junction->position(), 2.0)) ++touching;
+            return touching < 2;
+            }), junctions_.end());
+    }
 
