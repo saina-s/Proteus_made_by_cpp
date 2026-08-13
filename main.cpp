@@ -1201,3 +1201,192 @@ static const std::vector<LibraryEntry>& componentLibrary() {
 }
 
 
+// wire model, orthogonal routing, wire lookup, add, remove and reroute
+
+class Wire {
+public:
+    Wire() : id_(nextId_++) {}
+    Wire(std::shared_ptr<Pin> start, std::shared_ptr<Pin> end)
+        : id_(nextId_++), start_(std::move(start)), end_(std::move(end)) {
+        routeSimple();
+    }
+
+    WireId id() const { return id_; }
+    void setIdForLoad(WireId id) { id_ = id; nextId_ = std::max(nextId_, id_ + 1); }
+    const std::shared_ptr<Pin>& startPin() const { return start_; }
+    const std::shared_ptr<Pin>& endPin() const { return end_; }
+    void setPins(std::shared_ptr<Pin> start, std::shared_ptr<Pin> end) { start_ = std::move(start); end_ = std::move(end); }
+    const std::vector<Vec2>& path() const { return path_; }
+    void setPath(std::vector<Vec2> path, bool manual = true) {
+        path_ = cleanPath(std::move(path));
+        manualRoute_ = manual;
+    }
+    bool selected() const { return selected_; }
+    void setSelected(bool selected) { selected_ = selected; }
+    bool manualRoute() const { return manualRoute_; }
+
+    static std::vector<Vec2> orthogonalPath(Vec2 start, const std::vector<Vec2>& waypoints, Vec2 end) {
+        std::vector<Vec2> routed;
+        routed.reserve(2 + waypoints.size() * 2);
+        routed.push_back(start);
+
+        for (const Vec2& waypoint : waypoints) appendOrthogonalTarget(routed, waypoint);
+        appendOrthogonalTarget(routed, end);
+
+        return cleanPath(std::move(routed));
+    }
+
+    void routeSimple() {
+        manualRoute_ = false;
+        path_.clear();
+        if (!hasEndpoints()) return;
+        path_ = orthogonalPath(start_->worldPosition, {}, end_->worldPosition);
+    }
+
+    void reroutePreservingWaypoints() {
+        if (!hasEndpoints()) return;
+        if (!manualRoute_) {
+            routeSimple();
+            return;
+        }
+
+        std::vector<Vec2> preservedWaypoints;
+        if (path_.size() > 2) {
+            preservedWaypoints.assign(path_.begin() + 1, path_.end() - 1);
+        }
+
+        path_ = orthogonalPath(start_->worldPosition, preservedWaypoints, end_->worldPosition);
+        manualRoute_ = true;
+    }
+
+    bool hitTest(Vec2 world, double tolerance = 5.0) const {
+        for (std::size_t i = 1; i < path_.size(); ++i) {
+            if (pointSegmentDistance(world, path_[i - 1], path_[i]) <= tolerance) return true;
+        }
+        return false;
+    }
+
+private:
+    static constexpr double kRouteTolerance = 0.2;
+
+    bool hasEndpoints() const { return static_cast<bool>(start_) && static_cast<bool>(end_); }
+
+    static bool samePoint(const Vec2& a, const Vec2& b) {
+        return nearlyEqual(a, b, kRouteTolerance);
+    }
+
+    static bool sameVerticalLine(const Vec2& a, const Vec2& b) {
+        return nearlyEqual(a.x, b.x, kRouteTolerance);
+    }
+
+    static bool sameHorizontalLine(const Vec2& a, const Vec2& b) {
+        return nearlyEqual(a.y, b.y, kRouteTolerance);
+    }
+
+    static void appendOrthogonalTarget(std::vector<Vec2>& routed, Vec2 target) {
+        if (routed.empty()) {
+            routed.push_back(target);
+            return;
+        }
+
+        const Vec2 current = routed.back();
+        if (samePoint(current, target)) {
+            return;
+        }
+
+        if (!sameVerticalLine(current, target) && !sameHorizontalLine(current, target)) {
+            routed.push_back({ target.x, current.y });
+        }
+        routed.push_back(target);
+    }
+
+    static bool middlePointIsRedundant(const Vec2& a, const Vec2& b, const Vec2& c) {
+        const bool vertical = sameVerticalLine(a, b) && sameVerticalLine(b, c);
+        const bool horizontal = sameHorizontalLine(a, b) && sameHorizontalLine(b, c);
+        return vertical || horizontal;
+    }
+
+    static std::vector<Vec2> cleanPath(std::vector<Vec2> points) {
+        std::vector<Vec2> compact;
+        compact.reserve(points.size());
+
+        for (const Vec2& point : points) {
+            if (!compact.empty() && samePoint(compact.back(), point)) {
+                continue;
+            }
+            compact.push_back(point);
+
+            while (compact.size() >= 3) {
+                const std::size_t n = compact.size();
+                if (!middlePointIsRedundant(compact[n - 3], compact[n - 2], compact[n - 1])) {
+                    break;
+                }
+                compact.erase(compact.end() - 2);
+            }
+        }
+        return compact;
+    }
+
+    inline static WireId nextId_{ 1 };
+    WireId id_{ 0 };
+    std::shared_ptr<Pin> start_;
+    std::shared_ptr<Pin> end_;
+    std::vector<Vec2> path_;
+    bool selected_{ false };
+    bool manualRoute_{ false };
+};
+
+void removeComponent(ComponentId id) {
+    std::unordered_set<const Pin*> removedPins;
+    for (const auto& c : components_) if (c && c->id() == id) for (const auto& pin : c->pins()) if (pin) removedPins.insert(pin.get());
+    wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [&](const std::shared_ptr<Wire>& wire) {
+        return !wire || (wire->startPin() && removedPins.count(wire->startPin().get())) || (wire->endPin() && removedPins.count(wire->endPin().get()));
+        }), wires_.end());
+    components_.erase(std::remove_if(components_.begin(), components_.end(), [id](const auto& c) { return !c || c->id() == id; }), components_.end());
+    pruneUnusedJunctions(); modified_ = true;
+}
+
+bool addWire(std::shared_ptr<Wire> wire) {
+    if (!wire || !wire->startPin() || !wire->endPin() || wire->startPin() == wire->endPin()) return false;
+    for (const auto& existing : wires_) {
+        if (!existing) continue;
+        const bool same = existing->startPin() == wire->startPin() && existing->endPin() == wire->endPin();
+        const bool reverse = existing->startPin() == wire->endPin() && existing->endPin() == wire->startPin();
+        if (same || reverse) return false;
+    }
+    if (wire->path().size() < 2) wire->routeSimple();
+    wires_.push_back(std::move(wire)); modified_ = true; return true;
+}
+
+void removeWire(WireId id) {
+    wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [id](const auto& wire) { return !wire || wire->id() == id; }), wires_.end());
+    pruneUnusedJunctions(); modified_ = true;
+}
+
+
+std::shared_ptr<Wire> wireById(WireId id) const {
+    for (const auto& w : wires_) if (w && w->id() == id) return w;
+    return nullptr;
+}
+std::shared_ptr<Pin> pinByReference(ComponentId componentId, const std::string& pinName) const {
+    auto component = componentById(componentId); return component ? component->pinByName(pinName) : nullptr;
+}
+
+std::shared_ptr<Wire> wireAt(Vec2 world, double tolerance = 5.0) const {
+    for (auto it = wires_.rbegin(); it != wires_.rend(); ++it) if (*it && (*it)->hitTest(world, tolerance)) return *it;
+    return nullptr;
+}
+
+std::shared_ptr<Pin> pinAt(Vec2 world, double radius = kPinHoverRadius * 1.6) const {
+    std::shared_ptr<Pin> best; double bestDistance = radius;
+    for (const auto& component : components_) if (component) for (const auto& pin : component->pins()) if (pin) {
+        const double d = distance(world, pin->worldPosition); if (d <= bestDistance) { bestDistance = d; best = pin; }
+    }
+    return best;
+}
+
+void rerouteConnectedWires() {
+    for (auto& wire : wires_) if (wire) wire->reroutePreservingWaypoints();
+}
+
+
