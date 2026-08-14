@@ -1772,3 +1772,63 @@ private:
 
                 std::vector<std::string> messages_;
 
+            else if (auto inductor = std::dynamic_pointer_cast<Inductor>(component)) {
+                if (inductor->inductance() > 0.0) {
+                    const int nA = netOf(component->pinByName("A"));
+                    const int nB = netOf(component->pinByName("B"));
+                    system.addConductance(nA, nB, dt_ / inductor->inductance());
+                    system.addCurrentSource(nA, nB, inductorCurrentHistory_[component->id()]);
+                }
+            }
+            else if (auto pot = std::dynamic_pointer_cast<Potentiometer>(component)) {
+                const double rTotal = std::max(1e-3, pot->resistance());
+                const double w = pot->wiper();
+                system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("W")), 1.0 / (rTotal * w));
+                system.addConductance(netOf(component->pinByName("W")), netOf(component->pinByName("B")), 1.0 / (rTotal * (1.0 - w)));
+            }
+            else if (auto sw = std::dynamic_pointer_cast<Switch>(component)) {
+                const double switchCond = sw->closed() ? 100.0 : 1e-9;
+                system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("B")), switchCond);
+            }
+            else if (auto button = std::dynamic_pointer_cast<PushButton>(component)) {
+                const double btnCond = button->pressed() ? 100.0 : 1e-9;
+                system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("B")), btnCond);
+            }
+
+            else if (std::dynamic_pointer_cast<LED>(component)) {
+                const double vDiff = voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("K"));
+                const double effectiveResistance = (vDiff > 1.8) ? 330.0 : 1e8;
+                system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("K")), 1.0 / effectiveResistance);
+            }
+
+        for (const auto& component : document_->components()) {
+            if (std::dynamic_pointer_cast<Capacitor>(component)) {
+                capacitorVoltageHistory_[component->id()] =
+                    voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("B"));
+            }
+            else if (auto inductor = std::dynamic_pointer_cast<Inductor>(component)) {
+                const double vL = voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("B"));
+                inductorCurrentHistory_[component->id()] +=
+                    dt_ / std::max(1e-9, inductor->inductance()) * vL;
+            }
+
+    void updateConsumers() {
+        for (const auto& component : document_->components()) {
+            if (auto led = std::dynamic_pointer_cast<LED>(component)) led->setOn(voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("K")) > kLedThreshold);
+
+    void updateWireValues() {
+        wireLogicValues_.clear();
+        for (const auto& wire : document_->wires()) if (wire) {
+            const LogicState state = wire->startPin() ? logicAtPin(wire->startPin()) : LogicState::Undefined;
+            wireLogicValues_[wire->id()] = static_cast<int>(state);
+        }
+    }
+
+    void addMessageUnique(const std::string& message) {
+        if (std::find(messages_.begin(), messages_.end(), message) == messages_.end()) messages_.push_back(message);
+    }
+
+    std::unordered_map<ComponentId, double> capacitorVoltageHistory_;
+    std::unordered_map<ComponentId, double> inductorCurrentHistory_;
+    std::unordered_map<WireId, int> wireLogicValues_;
+
