@@ -1042,162 +1042,379 @@ private:
 };
 
 // Digital logic
+enum class GateKind { And, Or, Not, Xor, Nand };
 
-void GenericComponent::draw(CanvasPainter& painter, bool selected) const {
-    const Color stroke = selected ? Palette::Selection : Palette::DarkText;
-    const Color bodyFill{ 235, 238, 242, 255 };
-    auto P = [&](double x, double y) { return transformLocal({ x, y }); };
-    auto line = [&](double x1, double y1, double x2, double y2, Color c = Color{ 0, 0, 0, 0 }, int thickness = 2) {
-        if (c.a == 0) c = stroke;
-        painter.line(P(x1, y1), P(x2, y2), c, thickness);
-        };
-    auto circle = [&](double x, double y, double r, Color c, bool filled = false) { painter.circle(P(x, y), r, c, filled); };
-    auto localRect = [&](RectD r, Color c, bool filled = false, Color fill = {}) {
-        std::vector<Vec2> points{ P(r.left(), r.top()), P(r.right(), r.top()), P(r.right(), r.bottom()), P(r.left(), r.bottom()), P(r.left(), r.top()) };
-        if (filled) {
-            painter.rect(worldBounds(), c, true, fill);
-        }
-        painter.polyline(points, c, 2);
-        };
-    auto label = [&](const std::string& value, double x, double y, int size = 11, Color c = Color{ 0, 0, 0, 0 }) {
-        if (c.a == 0) c = stroke;
-        painter.textWorld(value, P(x, y), c, size, true);
-        };
-
-    if (type_ == "Ground") {
-        line(0, -20, 0, 0); line(-14, 0, 14, 0); line(-9, 5, 9, 5); line(-4, 10, 4, 10);
-    }
-    else if (type_ == "DCVoltageSource") {
-        line(0, -32, 0, -16); line(0, 16, 0, 32); circle(0, 0, 15, stroke, false); label("+", 0, -7, 11); label("-", 0, 8, 11);
-        label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
-    }
-    else if (type_ == "Battery") {
-        line(0, -32, 0, -12); line(0, 12, 0, 32); line(-13, -12, 13, -12); line(-8, -4, 8, -4, stroke, 3);
-        line(-13, 5, 13, 5); line(-8, 13, 8, 13, stroke, 3); label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
-    }
-
-
-    else if (type_ == "Resistor") {
-        line(-34, 0, -24, 0); line(24, 0, 34, 0);
-        std::vector<Vec2> zig{ P(-24, 0), P(-18, -9), P(-10, 9), P(-2, -9), P(6, 9), P(14, -9), P(24, 0) };
-        painter.polyline(zig, stroke, 2); label(label_, 0, -20, 10); label(compactStatus(), 0, 21, 8, Palette::Muted);
-    }
-    else if (type_ == "Capacitor") {
-        line(-34, 0, -7, 0); line(7, 0, 34, 0); line(-7, -13, -7, 13); line(7, -13, 7, 13); label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
-    }
-    else if (type_ == "Inductor") {
-        line(-34, 0, -22, 0); line(22, 0, 34, 0);
-        for (int i = 0; i < 4; ++i) {
-            const double cx = -16.5 + i * 11.0;
-            std::vector<Vec2> arc;
-            for (int k = 0; k <= 12; ++k) { const double a = kPi + kPi * k / 12.0; arc.push_back(P(cx + 5.5 * std::cos(a), 5.5 * std::sin(a))); }
-            painter.polyline(arc, stroke, 2);
-        }
-        label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
-    }
-    else if (type_ == "Potentiometer") {
-        line(-36, 0, -24, 0); line(24, 0, 36, 0); localRect({ -24, -8, 48, 16 }, stroke, true, bodyFill);
-        const auto* pot = dynamic_cast<const Potentiometer*>(this); const double wx = pot ? -20.0 + 40.0 * pot->wiper() : 0.0;
-        line(0, -30, wx, -9); line(wx, -9, wx - 4, -14); line(wx, -9, wx + 5, -12); label(label_, 0, 22, 10); label(compactStatus(), 0, 34, 8, Palette::Muted);
-    }
-    else if (type_ == "Switch" || type_ == "PushButton") {
-        const bool active = type_ == "Switch" ? dynamic_cast<const Switch*>(this)->closed() : dynamic_cast<const PushButton*>(this)->pressed();
-        line(-32, 0, -12, 0); line(12, 0, 32, 0); circle(-12, 0, 3, stroke, true); circle(12, 0, 3, stroke, true);
-        line(-12, 0, 12, active ? 0 : -14, active ? Palette::Accent2 : stroke, 3); label(label_, 0, -26, 10); label(compactStatus(), 0, 24, 8, active ? Palette::Accent2 : Palette::Muted);
-    }
-    else if (type_ == "LED") {
-        const auto* led = dynamic_cast<const LED*>(this); const Color lit = led && led->on() ? led->ledColor() : Color{ 100, 45, 45, 255 };
-        line(-30, 0, -13, 0); line(13, 0, 30, 0);
-        std::vector<Vec2> tri{ P(-13, -11), P(-13, 11), P(12, 0), P(-13, -11) }; painter.polyline(tri, stroke, 2); line(12, -11, 12, 11);
-        circle(0, 0, 9, lit, true); if (led && led->on()) { line(3, -13, 12, -22, lit, 2); line(9, -12, 18, -21, lit, 2); }
-        label(label_, 0, 24, 10); label(compactStatus(), 0, 35, 8, led && led->on() ? lit : Palette::Muted);
-    }
-    else if (type_ == "SevenSegment") {
-        const auto* display = dynamic_cast<const SevenSegment*>(this); const std::uint8_t mask = display ? display->mask() : 0;
-        localRect({ -42, -36, 84, 68 }, stroke, true, Color{ 45, 35, 35, 255 });
-        const Color on{ 250, 45, 35, 255 }, off{ 85, 35, 35, 255 };
-        auto seg = [&](int bit, double x1, double y1, double x2, double y2) { line(x1, y1, x2, y2, (mask & (1u << bit)) ? on : off, 5); };
-        seg(0, -20, -27, 20, -27); seg(1, 25, -23, 25, -2); seg(2, 25, 3, 25, 24); seg(3, -20, 28, 20, 28);
-        seg(4, -25, 3, -25, 24); seg(5, -25, -23, -25, -2); seg(6, -20, 0, 20, 0); circle(35, 27, 3, (mask & 0x80) ? on : off, true);
-        label(label_, 0, -48, 10);
-    }
-
-    else {
-        localRect(localBounds(), stroke, true, bodyFill); label(type_, 0, -5, 10); label(label_, 0, 10, 8, Palette::Muted);
-    }
-
-    if (selected) {
-        const RectD bounds = worldBounds();
-        painter.rect({ bounds.x - 4, bounds.y - 4, bounds.w + 8, bounds.h + 8 }, Palette::Selection, false);
-    }
-    drawPins(painter);
-}
-
-class ComponentFactory {
+class LogicGate : public GenericComponent {
 public:
-    static ComponentFactory& instance() {
-        static ComponentFactory factory;
-        return factory;
+    LogicGate(std::string typeName, GateKind kind, int inputCount)
+        : GenericComponent(std::move(typeName), ComponentCategory::Digital), kind_(kind), inputCount_(std::max(1, inputCount)) {
+        rebuildPins();
     }
 
-    std::shared_ptr<Component> create(const std::string& type) const {
-        auto it = creators_.find(type);
-        if (it != creators_.end()) {
-            return it->second();
+    int inputCount() const { return inputCount_; }
+    LogicState outputState() const { return outputValid_ ? (output_ ? LogicState::High : LogicState::Low) : LogicState::Undefined; }
+    bool output() const { return output_; }
+    bool outputValid() const { return outputValid_; }
+    double propagationDelayMs() const { return propagationDelayMs_; }
+
+    void evaluate(const std::vector<LogicState>& inputs, double dt) {
+        if (static_cast<int>(inputs.size()) < inputCount_ ||
+            std::any_of(inputs.begin(), inputs.begin() + inputCount_, [](LogicState s) { return s == LogicState::Undefined; })) {
+            outputValid_ = false;
+            transition_.active = false;
+            return;
         }
-        return nullptr;
+        bool result = false;
+        switch (kind_) {
+        case GateKind::And:
+        case GateKind::Nand:
+            result = true;
+            for (int i = 0; i < inputCount_; ++i) result = result && inputs[i] == LogicState::High;
+            if (kind_ == GateKind::Nand) result = !result;
+            break;
+        case GateKind::Or:
+            for (int i = 0; i < inputCount_; ++i) result = result || inputs[i] == LogicState::High;
+            break;
+        case GateKind::Not:
+            result = inputs[0] != LogicState::High;
+            break;
+        case GateKind::Xor: {
+            int count = 0;
+            for (int i = 0; i < inputCount_; ++i) count += inputs[i] == LogicState::High ? 1 : 0;
+            result = (count % 2) != 0;
+            break;
+        }
+        }
+        applyTarget(result, dt);
+    }
+
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"inputCount", "Input count", std::to_string(inputCount_), kind_ == GateKind::Not},
+                {"propagationDelayMs", "Propagation delay (ms)", formatDouble(propagationDelayMs_), false},
+                {"output", "Output", outputValid_ ? (output_ ? "HIGH" : "LOW") : "Undefined", true} };
+    }
+
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "inputCount" && kind_ != GateKind::Not) {
+            inputCount_ = clampValue(std::stoi(value), 1, 8); rebuildPins(); return true;
+        }
+        if (key == "propagationDelayMs") {
+            propagationDelayMs_ = std::max(0.0, std::stod(value)); return true;
+        }
+        return false;
+    }
+
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["inputCount"] = std::to_string(inputCount_);
+        s["propagationDelayMs"] = formatDouble(propagationDelayMs_, 12);
+        s["output"] = output_ ? "1" : "0";
+        s["outputValid"] = outputValid_ ? "1" : "0";
+        return s;
+    }
+
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("inputCount"); it != s.end()) inputCount_ = clampValue(std::stoi(it->second), 1, 8);
+        rebuildPins();
+        if (auto it = s.find("propagationDelayMs"); it != s.end()) propagationDelayMs_ = std::stod(it->second);
+        if (auto it = s.find("output"); it != s.end()) output_ = it->second == "1";
+        if (auto it = s.find("outputValid"); it != s.end()) outputValid_ = it->second == "1";
+    }
+
+    std::string gateText() const {
+        switch (kind_) {
+        case GateKind::And: return "&";
+        case GateKind::Or: return ">=1";
+        case GateKind::Not: return "1";
+        case GateKind::Xor: return "=1";
+        case GateKind::Nand: return "N&";
+        }
+        return "?";
     }
 
 private:
-    ComponentFactory() {
-        registerComponent<Ground>("Ground");
-        registerComponent<DCVoltageSource>("DCVoltageSource");
-        registerComponent<Battery>("Battery");
-        registerComponent<Resistor>("Resistor");
-        registerComponent<Capacitor>("Capacitor");
-        registerComponent<Inductor>("Inductor");
-        registerComponent<Potentiometer>("Potentiometer");
-        registerComponent<Switch>("Switch");
-        registerComponent<PushButton>("PushButton");
-        registerComponent<LED>("LED");
-        registerComponent<SevenSegment>("SevenSegment");
+    void rebuildPins() {
+        std::vector<std::shared_ptr<Pin>> pins;
+        auto out = std::make_shared<Pin>();
+        out->name = "OUT"; out->type = PinType::Output; out->localPosition = { 36, 0 }; pins.push_back(out);
+        const double spacing = inputCount_ > 1 ? 18.0 : 0.0;
+        const double startY = -(inputCount_ - 1) * spacing * 0.5;
+        for (int i = 0; i < inputCount_; ++i) {
+            auto pin = std::make_shared<Pin>();
+            pin->name = "IN" + std::to_string(i + 1); pin->type = PinType::Input;
+            pin->localPosition = { -36, startY + i * spacing }; pins.push_back(pin);
+        }
+        replacePins(std::move(pins));
     }
 
-    template<typename T>
-    void registerComponent(const std::string& name) {
-        creators_[name] = []() { return std::make_shared<T>(); };
+    void applyTarget(bool value, double dt) {
+        if (propagationDelayMs_ <= 0.0 || !outputValid_) {
+            output_ = value;
+            outputValid_ = true;
+            transition_.active = false;
+            return;
+        }
+
+        if (value == output_) {
+            transition_.active = false;
+            outputValid_ = true;
+            return;
+        }
+
+        if (!transition_.active || transition_.targetValue != value) {
+            transition_.active = true;
+            transition_.targetValue = value;
+            transition_.remainingMs = propagationDelayMs_;
+        }
+        else {
+            transition_.remainingMs -= std::max(0.0, dt) * 1000.0;
+            if (transition_.remainingMs <= 0.0) {
+                output_ = transition_.targetValue;
+                outputValid_ = true;
+                transition_.active = false;
+            }
+        }
     }
 
-    std::unordered_map<std::string, std::function<std::shared_ptr<Component>()>> creators_;
-};
-
-static std::shared_ptr<Component> createComponentByType(const std::string& type) {
-    return ComponentFactory::instance().create(type);
-}
-
-struct LibraryEntry {
-    std::string type;
-    ComponentCategory category;
-    std::string description;
-};
-
-static const std::vector<LibraryEntry>& componentLibrary() {
-    static const std::vector<LibraryEntry> entries = {
-        {"Ground", ComponentCategory::Sources, "Global 0 V reference. At least one ground is required."},
-        {"DCVoltageSource", ComponentCategory::Sources, "Ideal adjustable DC source with POS and NEG terminals."},
-        {"Battery", ComponentCategory::Sources, "Battery-like DC source."},
-        {"Resistor", ComponentCategory::Passive, "Ohmic two-terminal resistor."},
-        {"Capacitor", ComponentCategory::Passive, "Backward-Euler dynamic capacitor."},
-        {"Inductor", ComponentCategory::Passive, "Backward-Euler dynamic inductor."},
-        {"Potentiometer", ComponentCategory::Passive, "Three-terminal adjustable resistor."},
-        {"Switch", ComponentCategory::Interactive, "Persistent open/closed interactive switch."},
-        {"PushButton", ComponentCategory::Interactive, "Momentary switch: active only while held."},
-        {"LED", ComponentCategory::Interactive, "Colored LED with threshold and visual state."},
-        {"SevenSegment", ComponentCategory::Interactive, "Seven-segment display with A-G, DP and COM pins."},
+    struct TransitionEvent {
+        bool active{ false };
+        bool targetValue{ false };
+        double remainingMs{ 0.0 };
     };
-    return entries;
-}
 
+    GateKind kind_{ GateKind::And };
+    int inputCount_{ 2 };
+    bool output_{ false };
+    bool outputValid_{ true };
+    double propagationDelayMs_{ 1.0 };
+
+    TransitionEvent transition_;
+};
+
+class AndGate final : public LogicGate {
+public: AndGate() : LogicGate("AndGate", GateKind::And, 2) { setLabel("AND"); }
+};
+class OrGate final : public LogicGate {
+public: OrGate() : LogicGate("OrGate", GateKind::Or, 2) { setLabel("OR"); }
+};
+class NotGate final : public LogicGate {
+public: NotGate() : LogicGate("NotGate", GateKind::Not, 1) { setLabel("NOT"); }
+};
+class XorGate final : public LogicGate {
+public: XorGate() : LogicGate("XorGate", GateKind::Xor, 2) { setLabel("XOR"); }
+};
+class NandGate final : public LogicGate {
+public: NandGate() : LogicGate("NandGate", GateKind::Nand, 2) { setLabel("NAND"); }
+};
+
+class DFlipFlop final : public GenericComponent {
+public:
+    DFlipFlop() : GenericComponent("DFlipFlop", ComponentCategory::Digital) {
+        setLabel("DFF?");
+        addPin("D", PinType::Input, { -38, -11 }); addPin("CLK", PinType::Input, { -38, 12 });
+        addPin("Q", PinType::Output, { 38, -11 }); addPin("QB", PinType::Output, { 38, 12 });
+        updatePinWorldPositions();
+    }
+    void update(LogicState d, LogicState clock) {
+        if (d == LogicState::Undefined || clock == LogicState::Undefined) {
+            valid_ = false; previousClock_ = clock; return;
+        }
+        const bool clk = clock == LogicState::High;
+        const bool rising = previousClock_ == LogicState::Low && clk;
+        if (rising) { q_ = d == LogicState::High; valid_ = true; }
+        previousClock_ = clock;
+    }
+    bool q() const { return q_; }
+    bool valid() const { return valid_; }
+    RectD localBounds() const override { return { -42, -30, 84, 60 }; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"Q", "Q", valid_ ? (q_ ? "HIGH" : "LOW") : "Undefined", true} };
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["q"] = q_ ? "1" : "0"; s["valid"] = valid_ ? "1" : "0";
+        s["previousClock"] = std::to_string(static_cast<int>(previousClock_)); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("q"); it != s.end()) q_ = it->second == "1";
+        if (auto it = s.find("valid"); it != s.end()) valid_ = it->second == "1";
+        if (auto it = s.find("previousClock"); it != s.end()) previousClock_ = static_cast<LogicState>(std::stoi(it->second));
+    }
+    std::string compactStatus() const override { return valid_ ? (q_ ? "Q=HIGH" : "Q=LOW") : "Q=Undefined"; }
+private:
+    bool q_{ false };
+    bool valid_{ true };
+    LogicState previousClock_{ LogicState::Low };
+};
+// ADC and DAC
+class SimpleADC final : public GenericComponent {
+public:
+    SimpleADC() : GenericComponent("SimpleADC", ComponentCategory::Advanced) {
+        setLabel("ADC?"); rebuildPins();
+    }
+    int bits() const { return bits_; }
+    std::uint32_t outputCode() const { return outputCode_; }
+    void setAnalogInput(double input, double vMinus, double vPlus) {
+        inputVoltage_ = input; vrefMinus_ = vMinus; vrefPlus_ = vPlus;
+    }
+    void tick(double dt) {
+        const double span = vrefPlus_ - vrefMinus_;
+        std::uint32_t target = 0;
+        if (span > 1e-12) {
+            const double normalized = clampValue((inputVoltage_ - vrefMinus_) / span, 0.0, 1.0);
+            const std::uint32_t maxCode = (bits_ >= 31) ? std::numeric_limits<std::uint32_t>::max() : ((1u << bits_) - 1u);
+            target = static_cast<std::uint32_t>(std::llround(normalized * maxCode));
+        }
+
+        if (!task_.active || task_.targetCode != target) {
+            task_.active = true;
+            task_.targetCode = target;
+            task_.timeRemainingMs = conversionDelayMs_;
+        }
+
+        if (task_.active) {
+            task_.timeRemainingMs -= std::max(0.0, dt) * 1000.0;
+            if (task_.timeRemainingMs <= 0.0) {
+                outputCode_ = task_.targetCode;
+                task_.active = false;
+            }
+        }
+    }
+    RectD localBounds() const override { return { -54, -44, 108, 88 }; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"bits", "Output bits", std::to_string(bits_), false},
+                {"conversionDelayMs", "Conversion delay (ms)", formatDouble(conversionDelayMs_), false},
+                {"inputVoltage", "VIN", formatDouble(inputVoltage_), true},
+                {"outputCode", "Code", std::to_string(outputCode_), true} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "bits") { bits_ = clampValue(std::stoi(value), 1, 16); rebuildPins(); return true; }
+        if (key == "conversionDelayMs") { conversionDelayMs_ = std::max(0.0, std::stod(value)); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["bits"] = std::to_string(bits_);
+        s["conversionDelayMs"] = formatDouble(conversionDelayMs_, 12); s["outputCode"] = std::to_string(outputCode_); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("bits"); it != s.end()) bits_ = clampValue(std::stoi(it->second), 1, 16);
+        rebuildPins();
+        if (auto it = s.find("conversionDelayMs"); it != s.end()) conversionDelayMs_ = std::stod(it->second);
+        if (auto it = s.find("outputCode"); it != s.end()) outputCode_ = static_cast<std::uint32_t>(std::stoul(it->second));
+    }
+    std::string compactStatus() const override { return "code=" + std::to_string(outputCode_); }
+private:
+    void rebuildPins() {
+        std::vector<std::shared_ptr<Pin>> pins;
+        auto make = [&](std::string name, PinType type, Vec2 local) {
+            auto p = std::make_shared<Pin>(); p->name = std::move(name); p->type = type; p->localPosition = local; pins.push_back(p);
+            };
+        make("VIN", PinType::Input, { -52, -22 }); make("VREF+", PinType::Input, { -52, 0 }); make("VREF-", PinType::Input, { -52, 22 });
+        const double startY = -(bits_ - 1) * 7.0 * 0.5;
+        for (int i = 0; i < bits_; ++i) make("D" + std::to_string(i), PinType::Output, { 52, startY + i * 7.0 });
+        replacePins(std::move(pins));
+    }
+
+    struct ConversionTask {
+        bool active{ false };
+        std::uint32_t targetCode{ 0 };
+        double timeRemainingMs{ 0.0 };
+    };
+
+    int bits_{ 8 };
+    double conversionDelayMs_{ 1.0 };
+    double inputVoltage_{ 0.0 };
+    double vrefMinus_{ 0.0 };
+    double vrefPlus_{ 5.0 };
+    std::uint32_t outputCode_{ 0 };
+
+    ConversionTask task_;
+};
+
+class SimpleDAC final : public GenericComponent {
+public:
+    SimpleDAC() : GenericComponent("SimpleDAC", ComponentCategory::Advanced) {
+        setLabel("DAC?"); rebuildPins();
+    }
+    int bits() const { return bits_; }
+    double analogOutput() const { return outputVoltage_; }
+    void setDigitalInput(std::uint32_t code, double vMinus, double vPlus) {
+        inputCode_ = code; vrefMinus_ = vMinus; vrefPlus_ = vPlus;
+    }
+    void tick(double dt) {
+        const std::uint32_t maxCode = (1u << bits_) - 1u;
+        const double target = vrefMinus_ + (vrefPlus_ - vrefMinus_) * (maxCode ? static_cast<double>(inputCode_ & maxCode) / maxCode : 0.0);
+
+        if (!event_.active || std::abs(target - event_.targetVoltage) > 1e-12) {
+            event_.active = true;
+            event_.targetVoltage = target;
+            event_.countdownMs = conversionDelayMs_;
+        }
+
+        if (event_.active) {
+            event_.countdownMs -= std::max(0.0, dt) * 1000.0;
+            if (event_.countdownMs <= 0.0) {
+                outputVoltage_ = event_.targetVoltage;
+                event_.active = false;
+            }
+        }
+    }
+    RectD localBounds() const override { return { -54, -44, 108, 88 }; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"bits", "Input bits", std::to_string(bits_), false},
+                {"conversionDelayMs", "Conversion delay (ms)", formatDouble(conversionDelayMs_), false},
+                {"outputVoltage", "VOUT", formatDouble(outputVoltage_), true} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "bits") { bits_ = clampValue(std::stoi(value), 1, 16); rebuildPins(); return true; }
+        if (key == "conversionDelayMs") { conversionDelayMs_ = std::max(0.0, std::stod(value)); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["bits"] = std::to_string(bits_);
+        s["conversionDelayMs"] = formatDouble(conversionDelayMs_, 12); s["outputVoltage"] = formatDouble(outputVoltage_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("bits"); it != s.end()) bits_ = clampValue(std::stoi(it->second), 1, 16);
+        rebuildPins();
+        if (auto it = s.find("conversionDelayMs"); it != s.end()) conversionDelayMs_ = std::stod(it->second);
+        if (auto it = s.find("outputVoltage"); it != s.end()) outputVoltage_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(outputVoltage_) + " V"; }
+private:
+    void rebuildPins() {
+        std::vector<std::shared_ptr<Pin>> pins;
+        auto make = [&](std::string name, PinType type, Vec2 local) {
+            auto p = std::make_shared<Pin>(); p->name = std::move(name); p->type = type; p->localPosition = local; pins.push_back(p);
+            };
+        const double startY = -(bits_ - 1) * 7.0 * 0.5;
+        for (int i = 0; i < bits_; ++i) make("D" + std::to_string(i), PinType::Input, { -52, startY + i * 7.0 });
+        make("VREF+", PinType::Input, { 0, -44 }); make("VREF-", PinType::Input, { 0, 44 }); make("VOUT", PinType::Output, { 52, 0 });
+        replacePins(std::move(pins));
+    }
+
+    struct OutputEvent {
+        bool active{ false };
+        double targetVoltage{ 0.0 };
+        double countdownMs{ 0.0 };
+    };
+
+    int bits_{ 8 };
+    double conversionDelayMs_{ 1.0 };
+    std::uint32_t inputCode_{ 0 };
+    double vrefMinus_{ 0.0 };
+    double vrefPlus_{ 5.0 };
+    double outputVoltage_{ 0.0 };
+
+    OutputEvent event_;
+};
 
 // wire model, orthogonal routing, wire lookup, add, remove and reroute
 
@@ -1830,203 +2047,5 @@ private:
     std::unordered_map<ComponentId, double> inductorCurrentHistory_;
     std::unordered_map<WireId, int> wireLogicValues_;
 
-
-// Passive and interactive components
-
-enum class GateKind { And, Or, Not, Xor, Nand };
-
-class LogicGate : public GenericComponent {
-public:
-    LogicGate(std::string typeName, GateKind kind, int inputCount)
-        : GenericComponent(std::move(typeName), ComponentCategory::Digital), kind_(kind), inputCount_(std::max(1, inputCount)) {
-        rebuildPins();
-    }
-
-    int inputCount() const { return inputCount_; }
-    LogicState outputState() const { return outputValid_ ? (output_ ? LogicState::High : LogicState::Low) : LogicState::Undefined; }
-    bool output() const { return output_; }
-    bool outputValid() const { return outputValid_; }
-    double propagationDelayMs() const { return propagationDelayMs_; }
-
-    void evaluate(const std::vector<LogicState>& inputs, double dt) {
-        if (static_cast<int>(inputs.size()) < inputCount_ ||
-            std::any_of(inputs.begin(), inputs.begin() + inputCount_, [](LogicState s) { return s == LogicState::Undefined; })) {
-            outputValid_ = false;
-            transition_.active = false;
-            return;
-        }
-        bool result = false;
-        switch (kind_) {
-        case GateKind::And:
-        case GateKind::Nand:
-            result = true;
-            for (int i = 0; i < inputCount_; ++i) result = result && inputs[i] == LogicState::High;
-            if (kind_ == GateKind::Nand) result = !result;
-            break;
-        case GateKind::Or:
-            for (int i = 0; i < inputCount_; ++i) result = result || inputs[i] == LogicState::High;
-            break;
-        case GateKind::Not:
-            result = inputs[0] != LogicState::High;
-            break;
-        case GateKind::Xor: {
-            int count = 0;
-            for (int i = 0; i < inputCount_; ++i) count += inputs[i] == LogicState::High ? 1 : 0;
-            result = (count % 2) != 0;
-            break;
-        }
-        }
-        applyTarget(result, dt);
-    }
-
-    std::vector<PropertyDescriptor> properties() const override {
-        return { {"label", "Label", label_, false},
-                {"inputCount", "Input count", std::to_string(inputCount_), kind_ == GateKind::Not},
-                {"propagationDelayMs", "Propagation delay (ms)", formatDouble(propagationDelayMs_), false},
-                {"output", "Output", outputValid_ ? (output_ ? "HIGH" : "LOW") : "Undefined", true} };
-    }
-
-    bool setProperty(const std::string& key, const std::string& value) override {
-        if (Component::setProperty(key, value)) return true;
-        if (key == "inputCount" && kind_ != GateKind::Not) {
-            inputCount_ = clampValue(std::stoi(value), 1, 8); rebuildPins(); return true;
-        }
-        if (key == "propagationDelayMs") {
-            propagationDelayMs_ = std::max(0.0, std::stod(value)); return true;
-        }
-        return false;
-    }
-
-    std::map<std::string, std::string> persistentState() const override {
-        auto s = Component::persistentState();
-        s["inputCount"] = std::to_string(inputCount_);
-        s["propagationDelayMs"] = formatDouble(propagationDelayMs_, 12);
-        s["output"] = output_ ? "1" : "0";
-        s["outputValid"] = outputValid_ ? "1" : "0";
-        return s;
-    }
-
-    void loadPersistentState(const std::map<std::string, std::string>& s) override {
-        Component::loadPersistentState(s);
-        if (auto it = s.find("inputCount"); it != s.end()) inputCount_ = clampValue(std::stoi(it->second), 1, 8);
-        rebuildPins();
-        if (auto it = s.find("propagationDelayMs"); it != s.end()) propagationDelayMs_ = std::stod(it->second);
-        if (auto it = s.find("output"); it != s.end()) output_ = it->second == "1";
-        if (auto it = s.find("outputValid"); it != s.end()) outputValid_ = it->second == "1";
-    }
-
-    std::string gateText() const {
-        switch (kind_) {
-        case GateKind::And: return "&";
-        case GateKind::Or: return ">=1";
-        case GateKind::Not: return "1";
-        case GateKind::Xor: return "=1";
-        case GateKind::Nand: return "N&";
-        }
-        return "?";
-    }
-
-private:
-    void rebuildPins() {
-        std::vector<std::shared_ptr<Pin>> pins;
-        auto out = std::make_shared<Pin>();
-        out->name = "OUT"; out->type = PinType::Output; out->localPosition = { 36, 0 }; pins.push_back(out);
-        const double spacing = inputCount_ > 1 ? 18.0 : 0.0;
-        const double startY = -(inputCount_ - 1) * spacing * 0.5;
-        for (int i = 0; i < inputCount_; ++i) {
-            auto pin = std::make_shared<Pin>();
-            pin->name = "IN" + std::to_string(i + 1); pin->type = PinType::Input;
-            pin->localPosition = { -36, startY + i * spacing }; pins.push_back(pin);
-        }
-        replacePins(std::move(pins));
-    }
-
-    void applyTarget(bool value, double dt) {
-        if (propagationDelayMs_ <= 0.0 || !outputValid_) {
-            output_ = value;
-            outputValid_ = true;
-            transition_.active = false;
-            return;
-        }
-
-        if (value == output_) {
-            transition_.active = false;
-            outputValid_ = true;
-            return;
-        }
-
-        if (!transition_.active || transition_.targetValue != value) {
-            transition_.active = true;
-            transition_.targetValue = value;
-            transition_.remainingMs = propagationDelayMs_;
-        }
-        else {
-            transition_.remainingMs -= std::max(0.0, dt) * 1000.0;
-            if (transition_.remainingMs <= 0.0) {
-                output_ = transition_.targetValue;
-                outputValid_ = true;
-                transition_.active = false;
-            }
-        }
-    }
-
-    struct TransitionEvent {
-        bool active{ false };
-        bool targetValue{ false };
-        double remainingMs{ 0.0 };
-    };
-
-    GateKind kind_{ GateKind::And };
-    int inputCount_{ 2 };
-    bool output_{ false };
-    bool outputValid_{ true };
-    double propagationDelayMs_{ 1.0 };
-
-    TransitionEvent transition_;
-};
-
-class AndGate final : public LogicGate {
-public: AndGate() : LogicGate("AndGate", GateKind::And, 2) { setLabel("AND"); }
-};
-class OrGate final : public LogicGate {
-public: OrGate() : LogicGate("OrGate", GateKind::Or, 2) { setLabel("OR"); }
-};
-class NotGate final : public LogicGate {
-public: NotGate() : LogicGate("NotGate", GateKind::Not, 1) { setLabel("NOT"); }
-};
-class XorGate final : public LogicGate {
-public: XorGate() : LogicGate("XorGate", GateKind::Xor, 2) { setLabel("XOR"); }
-};
-class NandGate final : public LogicGate {
-public: NandGate() : LogicGate("NandGate", GateKind::Nand, 2) { setLabel("NAND"); }
-};
-
-
-    else if (type_ == "ClockGenerator") {
-        localRect({ -30, -20, 60, 40 }, stroke, true, bodyFill); line(-16, 5, -16, -5); line(-16, -5, -6, -5); line(-6, -5, -6, 5);
-        line(-6, 5, 5, 5); line(5, 5, 5, -5); line(5, -5, 15, -5); line(30, 0, 34, 0); label(label_, 0, -31, 10); label(compactStatus(), 0, 31, 8, Palette::Muted);
-    }
-
-    else if (auto gate = dynamic_cast<const LogicGate*>(this)) {
-        localRect({ -30, -24, 60, 48 }, stroke, true, Color{ 225, 230, 250, 255 });
-        label(gate->gateText(), 0, -6, 14); label(label_, 0, 10, 8, Palette::Muted); line(30, 0, 36, 0);
-        for (const auto& pin : pins_) if (pin && pin->name.rfind("IN", 0) == 0) line(-36, pin->localPosition.y, -30, pin->localPosition.y);
-        circle(25, 0, 4, gate->outputValid() ? (gate->output() ? Palette::WireHigh : Palette::WireLow) : Palette::Warning, true);
-    }
-
-        registerComponent<ClockGenerator>("ClockGenerator");
-
-        registerComponent<AndGate>("AndGate");
-        registerComponent<OrGate>("OrGate");
-        registerComponent<NotGate>("NotGate");
-        registerComponent<XorGate>("XorGate");
-        registerComponent<NandGate>("NandGate");
-
-        {"ClockGenerator", ComponentCategory::Sources, "0/5 V square-wave digital clock."},
-        {"AndGate", ComponentCategory::Digital, "Configurable-input AND gate with propagation delay."},
-        {"OrGate", ComponentCategory::Digital, "Configurable-input OR gate with propagation delay."},
-        {"NotGate", ComponentCategory::Digital, "Digital inverter with propagation delay."},
-        {"XorGate", ComponentCategory::Digital, "Configurable-input XOR gate with propagation delay."},
-        {"NandGate", ComponentCategory::Digital, "Configurable-input NAND gate with propagation delay."},
 
 
