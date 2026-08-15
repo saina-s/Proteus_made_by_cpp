@@ -1416,6 +1416,578 @@ private:
     OutputEvent event_;
 };
 
+
+// MCU, memory and peripherals
+
+class Microcontroller final : public GenericComponent {
+public:
+    class Port {
+    public:
+        bool readBit(int index) const {
+            if (index < 0 || index >= 8) return false;
+            const std::size_t i = static_cast<std::size_t>(index);
+            return outputEnabled_[i] ? outputBits_[i] : inputBits_[i];
+        }
+
+        void sampleInputBit(int index, bool high) {
+            if (index >= 0 && index < 8) inputBits_[static_cast<std::size_t>(index)] = high;
+        }
+
+        void writeBit(int index, bool high) {
+            if (index < 0 || index >= 8) return;
+            const std::size_t i = static_cast<std::size_t>(index);
+            outputBits_[i] = high;
+            outputEnabled_[i] = true;
+        }
+
+        bool drivesBit(int index, bool& high) const {
+            if (index < 0 || index >= 8) return false;
+            const std::size_t i = static_cast<std::size_t>(index);
+            if (!outputEnabled_[i]) return false;
+            high = outputBits_[i];
+            return true;
+        }
+
+        void reset() {
+            inputBits_.fill(false);
+            outputBits_.fill(false);
+            outputEnabled_.fill(false);
+        }
+
+        std::uint8_t valueByte() const {
+            std::uint8_t value = 0;
+            for (int bitIndex = 0; bitIndex < 8; ++bitIndex)
+                if (readBit(bitIndex)) value |= static_cast<std::uint8_t>(1u << bitIndex);
+            return value;
+        }
+
+        std::uint8_t outputByte() const {
+            std::uint8_t value = 0;
+            for (int bitIndex = 0; bitIndex < 8; ++bitIndex)
+                if (outputBits_[static_cast<std::size_t>(bitIndex)]) value |= static_cast<std::uint8_t>(1u << bitIndex);
+            return value;
+        }
+
+        std::uint8_t driveMask() const {
+            std::uint8_t value = 0;
+            for (int bitIndex = 0; bitIndex < 8; ++bitIndex)
+                if (outputEnabled_[static_cast<std::size_t>(bitIndex)]) value |= static_cast<std::uint8_t>(1u << bitIndex);
+            return value;
+        }
+
+        void loadOutputState(std::uint8_t value, std::uint8_t mask) {
+            for (int bitIndex = 0; bitIndex < 8; ++bitIndex) {
+                const std::size_t i = static_cast<std::size_t>(bitIndex);
+                outputBits_[i] = ((value >> bitIndex) & 1u) != 0;
+                outputEnabled_[i] = ((mask >> bitIndex) & 1u) != 0;
+            }
+        }
+
+    private:
+        std::array<bool, 8> inputBits_{};
+        std::array<bool, 8> outputBits_{};
+        std::array<bool, 8> outputEnabled_{};
+    };
+
+    static constexpr std::size_t kInternalRamSize = 256;
+    static constexpr std::uint8_t kPortAOperand = 0xA0;
+    static constexpr std::uint8_t kPortBOperand = 0xB0;
+
+    Microcontroller()
+        : GenericComponent("Microcontroller", ComponentCategory::Advanced),
+        ram_(kInternalRamSize, 0) {
+        setLabel("MCU?");
+        for (int i = 0; i < 8; ++i) addPin(pinName('A', i), PinType::Bidirectional, { -58, -35 + i * 10.0 });
+        for (int i = 0; i < 8; ++i) addPin(pinName('B', i), PinType::Bidirectional, { 58, -35 + i * 10.0 });
+        addPin("VCC", PinType::Power, { -20, -52 }); addPin("GND", PinType::Ground, { 20, 52 });
+        updatePinWorldPositions();
+    }
+
+    static std::string pinName(char port, int bit) {
+        return "Port" + std::string(1, port) + "." + std::to_string(bit);
+    }
+
+    static bool decodePinName(const std::string& name, char& port, int& bit) {
+        if (name.size() != 7 || name.rfind("Port", 0) != 0 || name[5] != '.') return false;
+        if (name[4] != 'A' && name[4] != 'B') return false;
+        if (name[6] < '0' || name[6] > '7') return false;
+        port = name[4];
+        bit = name[6] - '0';
+        return true;
+    }
+
+    RectD localBounds() const override { return { -62, -56, 124, 112 }; }
+
+    bool loadIntelHex(const std::string& path, std::string& error) {
+        std::ifstream input(path);
+        if (!input) { error = "Cannot open Intel HEX file: " + path; return false; }
+        std::vector<std::uint8_t> image;
+        std::string line;
+        std::uint32_t base = 0;
+        int lineNumber = 0;
+        while (std::getline(input, line)) {
+            ++lineNumber; line = trim(line); if (line.empty()) continue;
+            if (line.front() != ':') { error = "HEX line " + std::to_string(lineNumber) + " has no ':'"; return false; }
+            auto byteAt = [&](std::size_t offset, bool& ok) -> int {
+                if (offset + 2 > line.size()) { ok = false; return 0; }
+                try { return std::stoi(line.substr(offset, 2), nullptr, 16); }
+                catch (...) { ok = false; return 0; }
+                };
+            bool ok = true;
+            const int count = byteAt(1, ok);
+            const int address = std::stoi(line.substr(3, 4), nullptr, 16);
+            const int type = byteAt(7, ok);
+            if (!ok || line.size() < static_cast<std::size_t>(11 + count * 2)) {
+                error = "Invalid HEX record at line " + std::to_string(lineNumber); return false;
+            }
+            int checksum = count + ((address >> 8) & 0xff) + (address & 0xff) + type;
+            std::vector<std::uint8_t> data;
+            for (int i = 0; i < count; ++i) {
+                const int byte = byteAt(9 + i * 2, ok); if (!ok) { error = "Invalid HEX byte"; return false; }
+                data.push_back(static_cast<std::uint8_t>(byte)); checksum += byte;
+            }
+            const int recordChecksum = byteAt(9 + count * 2, ok);
+            if (!ok || ((checksum + recordChecksum) & 0xff) != 0) {
+                error = "HEX checksum failure at line " + std::to_string(lineNumber); return false;
+            }
+            if (type == 0x00) {
+                const std::uint32_t absolute = base + static_cast<std::uint32_t>(address);
+                if (image.size() < absolute + data.size()) image.resize(absolute + data.size(), 0);
+                std::copy(data.begin(), data.end(), image.begin() + absolute);
+            }
+            else if (type == 0x01) {
+                break;
+            }
+            else if (type == 0x04 && data.size() == 2) {
+                base = (static_cast<std::uint32_t>(data[0]) << 24) |
+                    (static_cast<std::uint32_t>(data[1]) << 16);
+            }
+        }
+        flash_ = std::move(image); firmwarePath_ = path; resetCpu(); return true;
+    }
+
+    void resetCpu() {
+        pc_ = 0;
+        accumulator_ = 0;
+        portA_.reset();
+        portB_.reset();
+        std::fill(ram_.begin(), ram_.end(), 0);
+    }
+
+    bool readPortBit(char port, int bit) const {
+        const Port* selected = portFor(port);
+        return selected ? selected->readBit(bit) : false;
+    }
+
+    void sampleInputPortBit(char port, int bit, bool high) {
+        Port* selected = portFor(port);
+        if (selected) selected->sampleInputBit(bit, high);
+    }
+
+    void writePortBit(char port, int bit, bool high) {
+        Port* selected = portFor(port);
+        if (selected) selected->writeBit(bit, high);
+    }
+
+    bool drivesPortBit(char port, int bit, bool& high) const {
+        const Port* selected = portFor(port);
+        return selected ? selected->drivesBit(bit, high) : false;
+    }
+
+    void tickCpu() {
+        if (pc_ >= flash_.size()) return;
+
+        auto fetch8 = [&]() -> std::uint8_t {
+            return pc_ < flash_.size() ? flash_[pc_++] : 0;
+            };
+        auto fetch16 = [&]() -> std::uint16_t {
+            const std::uint16_t low = fetch8();
+            const std::uint16_t high = fetch8();
+            return static_cast<std::uint16_t>(low | (high << 8));
+            };
+        auto decodePortOperand = [&](std::uint8_t encoded) -> char {
+            if (encoded == kPortAOperand) return 'A';
+            if (encoded == kPortBOperand) return 'B';
+            return '\0';
+            };
+
+        const std::uint8_t opcode = fetch8();
+        switch (opcode) {
+        case 0x00:
+            break; // NOP
+
+        case 0x10:
+            accumulator_ = fetch8();
+            break; // MOV A, #imm8
+
+        case 0x20: {
+            const std::uint16_t address = fetch16();
+            if (address < ram_.size()) ram_[address] = accumulator_;
+            break; // MOV RAM[addr16], A
+        }
+
+        case 0x21: {
+            const std::uint16_t address = fetch16();
+            if (address < ram_.size()) accumulator_ = ram_[address];
+            break; // MOV A, RAM[addr16]
+        }
+
+        case 0x30:
+            accumulator_ = static_cast<std::uint8_t>(accumulator_ + fetch8());
+            break; // ADD A, #imm8
+
+        case 0x40:
+            pc_ = fetch16();
+            break; // JMP addr16
+
+        case 0x50: {
+            const char port = decodePortOperand(fetch8());
+            const std::uint8_t bit = fetch8();
+            if (port != '\0' && bit < 8) writePortBit(port, bit, true);
+            break; // SETB PortA/PortB, bit
+        }
+
+        case 0x51: {
+            const char port = decodePortOperand(fetch8());
+            const std::uint8_t bit = fetch8();
+            if (port != '\0' && bit < 8) writePortBit(port, bit, false);
+            break; // CLR PortA/PortB, bit
+        }
+
+        default:
+            break;
+        }
+    }
+
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"firmwarePath", "Intel HEX path", firmwarePath_, false},
+                {"programSize", "Program bytes", std::to_string(flash_.size()), true},
+                {"PC", "Program Counter", std::to_string(pc_), false}, {"ACC", "Accumulator", std::to_string(accumulator_), false},
+                {"PortA", "Port A", std::to_string(portA_.valueByte()), true},
+                {"PortB", "Port B", std::to_string(portB_.valueByte()), true},
+                {"ramSize", "Internal RAM (bytes)", std::to_string(ram_.size()), true} };
+    }
+
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "firmwarePath") { std::string error; return loadIntelHex(value, error); }
+        if (key == "PC") { pc_ = static_cast<std::uint16_t>(std::stoul(value)); return true; }
+        if (key == "ACC") { accumulator_ = static_cast<std::uint8_t>(std::stoul(value)); return true; }
+        return false;
+    }
+
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["firmwarePath"] = firmwarePath_; s["pc"] = std::to_string(pc_); s["acc"] = std::to_string(accumulator_);
+        s["portA"] = std::to_string(portA_.outputByte()); s["portB"] = std::to_string(portB_.outputByte());
+        s["portADriveMask"] = std::to_string(portA_.driveMask()); s["portBDriveMask"] = std::to_string(portB_.driveMask());
+        std::ostringstream flash; flash << std::hex << std::setfill('0');
+        for (auto byte : flash_) flash << std::setw(2) << static_cast<int>(byte);
+        s["flash"] = flash.str();
+        std::ostringstream ram; ram << std::hex << std::setfill('0');
+        for (auto byte : ram_) ram << std::setw(2) << static_cast<int>(byte);
+        s["ram"] = ram.str();
+        return s;
+    }
+
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("firmwarePath"); it != s.end()) firmwarePath_ = it->second;
+        if (auto it = s.find("pc"); it != s.end()) pc_ = static_cast<std::uint16_t>(std::stoul(it->second));
+        if (auto it = s.find("acc"); it != s.end()) accumulator_ = static_cast<std::uint8_t>(std::stoul(it->second));
+        if (auto it = s.find("portA"); it != s.end()) {
+            const auto mask = s.find("portADriveMask");
+            portA_.loadOutputState(static_cast<std::uint8_t>(std::stoul(it->second)),
+                mask != s.end() ? static_cast<std::uint8_t>(std::stoul(mask->second)) : 0xffu);
+        }
+        else if (auto it = s.find("p0"); it != s.end()) {
+            portA_.loadOutputState(static_cast<std::uint8_t>(std::stoul(it->second)), 0xffu);
+        }
+        if (auto it = s.find("portB"); it != s.end()) {
+            const auto mask = s.find("portBDriveMask");
+            portB_.loadOutputState(static_cast<std::uint8_t>(std::stoul(it->second)),
+                mask != s.end() ? static_cast<std::uint8_t>(std::stoul(mask->second)) : 0xffu);
+        }
+        else if (auto it = s.find("p1"); it != s.end()) {
+            portB_.loadOutputState(static_cast<std::uint8_t>(std::stoul(it->second)), 0xffu);
+        }
+
+        auto parseHex = [](const std::string& hex) {
+            std::vector<std::uint8_t> out;
+            for (std::size_t i = 0; i + 1 < hex.size(); i += 2)
+                out.push_back(static_cast<std::uint8_t>(std::stoi(hex.substr(i, 2), nullptr, 16)));
+            return out;
+            };
+        if (auto it = s.find("flash"); it != s.end()) flash_ = parseHex(it->second);
+        if (auto it = s.find("ram"); it != s.end()) ram_ = parseHex(it->second);
+        ram_.resize(kInternalRamSize, 0);
+    }
+
+    std::string compactStatus() const override {
+        return "PC=" + std::to_string(pc_) + " ACC=" + std::to_string(accumulator_);
+    }
+
+private:
+    Port* portFor(char port) {
+        if (port == 'A') return &portA_;
+        if (port == 'B') return &portB_;
+        return nullptr;
+    }
+
+    const Port* portFor(char port) const {
+        if (port == 'A') return &portA_;
+        if (port == 'B') return &portB_;
+        return nullptr;
+    }
+
+    std::vector<std::uint8_t> flash_;
+    std::vector<std::uint8_t> ram_;
+    std::string firmwarePath_;
+    std::uint16_t pc_{ 0 };
+    std::uint8_t accumulator_{ 0 };
+    Port portA_;
+    Port portB_;
+};
+class ExternalMemory final : public GenericComponent {
+public:
+    ExternalMemory() : GenericComponent("ExternalMemory", ComponentCategory::Advanced) {
+        setLabel("RAM?");
+        rebuildPins();
+    }
+
+    uint8_t readData() const {
+        if (!readActive_) return 0;
+        auto it = storage_.find(currentAddress_);
+        return (it != storage_.end()) ? it->second : 0x00;
+    }
+
+    void writeData(uint8_t data) {
+        if (writeActive_) {
+            storage_[currentAddress_] = data;
+        }
+    }
+
+    void setBusState(uint16_t addr, bool readEn, bool writeEn) {
+        currentAddress_ = addr & 0x01FF;
+        readActive_ = readEn;
+        writeActive_ = writeEn;
+    }
+    void setReadBus(uint16_t addr, bool enable) { currentAddress_ = addr & 0x01FF; readActive_ = enable; }
+    void write(uint16_t addr, uint8_t data) { currentAddress_ = addr & 0x01FF; storage_[currentAddress_] = data; }
+
+    bool readActive() const { return readActive_; }
+    bool writeActive() const { return writeActive_; }
+
+    std::vector<PropertyDescriptor> properties() const override {
+        return {
+            {"label", "Label", label_, false},
+            {"capacity", "Capacity", std::to_string(storageCapacity_) + " Bytes", true},
+            {"usedCells", "Allocated Cells", std::to_string(storage_.size()), true}
+        };
+    }
+
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "capacity") {
+            storageCapacity_ = clampValue(std::stoi(value), 64, 4096);
+            return true;
+        }
+        return false;
+    }
+
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["capacity"] = std::to_string(storageCapacity_);
+        std::string memDump;
+        for (const auto& [addr, val] : storage_) {
+            memDump += std::to_string(addr) + ":" + std::to_string(val) + ";";
+        }
+        s["memoryDump"] = memDump;
+        return s;
+    }
+
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("capacity"); it != s.end()) {
+            storageCapacity_ = clampValue(std::stoi(it->second), 64, 4096);
+        }
+        storage_.clear();
+        if (auto it = s.find("memoryDump"); it != s.end()) {
+            std::stringstream ss(it->second);
+            std::string item;
+            while (std::getline(ss, item, ';')) {
+                if (item.empty()) continue;
+                auto pos = item.find(':');
+                if (pos != std::string::npos) {
+                    uint16_t addr = static_cast<uint16_t>(std::stoi(item.substr(0, pos)));
+                    uint8_t val = static_cast<uint8_t>(std::stoi(item.substr(pos + 1)));
+                    storage_[addr] = val;
+                }
+            }
+        }
+    }
+
+    std::string compactStatus() const override {
+        return "RAM: " + std::to_string(storage_.size()) + " B used";
+    }
+
+private:
+    void rebuildPins() {
+        std::vector<std::shared_ptr<Pin>> pins;
+        for (int i = 0; i < 8; ++i) {
+            auto pinA = std::make_shared<Pin>();
+            pinA->name = "A" + std::to_string(i);
+            pinA->type = PinType::Input;
+            pinA->localPosition = { -52, -30.0 + i * 8.0 };
+            pins.push_back(pinA);
+
+            auto pinD = std::make_shared<Pin>();
+            pinD->name = "D" + std::to_string(i);
+            pinD->type = PinType::Output;
+            pinD->localPosition = { 52, -30.0 + i * 8.0 };
+            pins.push_back(pinD);
+        }
+
+        auto pinRD = std::make_shared<Pin>();
+        pinRD->name = "RD"; pinRD->type = PinType::Input; pinRD->localPosition = { -20, 44 };
+        pins.push_back(pinRD);
+
+        auto pinWR = std::make_shared<Pin>();
+        pinWR->name = "WR"; pinWR->type = PinType::Input; pinWR->localPosition = { 20, 44 };
+        pins.push_back(pinWR);
+
+        replacePins(std::move(pins));
+    }
+
+    int storageCapacity_{ 512 };
+    uint16_t currentAddress_{ 0 };
+    bool readActive_{ false };
+    bool writeActive_{ false };
+    std::unordered_map<uint16_t, uint8_t> storage_;
+};
+
+class LCD16x2 final : public GenericComponent {
+public:
+    LCD16x2() : GenericComponent("LCD16x2", ComponentCategory::Peripheral), line1_(16, ' '), line2_(16, ' ') {
+        setLabel("LCD?");
+        addPin("RS", PinType::Input, { -66, -30 }); addPin("RW", PinType::Input, { -66, -18 }); addPin("E", PinType::Input, { -66, -6 });
+        for (int i = 0; i < 8; ++i) addPin("D" + std::to_string(i), PinType::Bidirectional, { -56 + i * 16.0, 38 });
+        addPin("VCC", PinType::Power, { -32, -38 }); addPin("GND", PinType::Ground, { -16, -38 });
+        updatePinWorldPositions();
+    }
+    RectD localBounds() const override { return { -70, -44, 140, 88 }; }
+    const std::string& line1() const { return line1_; }
+    const std::string& line2() const { return line2_; }
+    void tickBus(bool rs, bool rw, bool enable, std::uint8_t data) {
+        const bool writeEdge = enable && !previousEnable_;
+        previousEnable_ = enable;
+
+        if (!writeEdge || rw) return;
+
+        if (rs) {
+            writeData(data);
+            return;
+        }
+        executeCommand(data);
+    }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"line1", "Line 1", line1_, false}, {"line2", "Line 2", line2_, false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "line1") { line1_ = value.substr(0, 16); line1_.resize(16, ' '); return true; }
+        if (key == "line2") { line2_ = value.substr(0, 16); line2_.resize(16, ' '); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["line1"] = line1_; s["line2"] = line2_; s["cursor"] = std::to_string(cursor_); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("line1"); it != s.end()) { line1_ = it->second.substr(0, 16); line1_.resize(16, ' '); }
+        if (auto it = s.find("line2"); it != s.end()) { line2_ = it->second.substr(0, 16); line2_.resize(16, ' '); }
+        if (auto it = s.find("cursor"); it != s.end()) cursor_ = clampValue(std::stoi(it->second), 0, 31);
+    }
+private:
+    void executeCommand(std::uint8_t command) {
+        if (command == 0x01u) {
+            clear();
+            return;
+        }
+
+        if ((command & 0x80u) == 0) return;
+        setCursorFromAddress(static_cast<std::uint8_t>(command & 0x7fu));
+    }
+
+    void setCursorFromAddress(std::uint8_t address) {
+        int position = static_cast<int>(address);
+        if (address >= 0x40u) position = 16 + static_cast<int>(address - 0x40u);
+        cursor_ = clampValue(position, 0, 31);
+    }
+
+    void clear() {
+        line1_.assign(16, ' ');
+        line2_.assign(16, ' ');
+        cursor_ = 0;
+    }
+
+    void writeData(std::uint8_t data) {
+        const char character = static_cast<char>(data);
+        if (cursor_ < 16) line1_[cursor_] = character;
+        else line2_[cursor_ - 16] = character;
+        cursor_ = (cursor_ + 1) % 32;
+    }
+
+    std::string line1_;
+    std::string line2_;
+    bool previousEnable_{ false };
+    int cursor_{ 0 };
+};
+
+class Keypad final : public GenericComponent {
+public:
+    Keypad() : GenericComponent("Keypad", ComponentCategory::Peripheral) {
+        setLabel("KPD?");
+        for (int i = 0; i < 4; ++i) addPin("R" + std::to_string(i + 1), PinType::Input, { -54, -30 + i * 20.0 });
+        for (int i = 0; i < 4; ++i) addPin("C" + std::to_string(i + 1), PinType::Output, { 54, -30 + i * 20.0 });
+        updatePinWorldPositions();
+    }
+    RectD localBounds() const override { return { -58, -46, 116, 92 }; }
+    void setPressedKey(std::string key) {
+        key = toLower(trim(key)); pressedRow_ = pressedColumn_ = -1;
+        static const std::array<std::array<std::string, 4>, 4> keys{ {
+            {{"1", "2", "3", "a"}}, {{"4", "5", "6", "b"}}, {{"7", "8", "9", "c"}}, {{"*", "0", "#", "d"}}
+        } };
+        for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) if (keys[r][c] == key) { pressedRow_ = r; pressedColumn_ = c; }
+    }
+    std::string pressedKey() const {
+        static const char* keys[4][4] = { {"1", "2", "3", "A"}, {"4", "5", "6", "B"}, {"7", "8", "9", "C"}, {"*", "0", "#", "D"} };
+        return pressedRow_ < 0 ? "none" : keys[pressedRow_][pressedColumn_];
+    }
+    bool columnActive(int column, const std::array<bool, 4>& rowLow) const {
+        return column == pressedColumn_ && pressedRow_ >= 0 && rowLow[pressedRow_];
+    }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"pressedKey", "Pressed key", pressedKey(), false} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "pressedKey") { setPressedKey(value); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["pressedKey"] = pressedKey(); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s); if (auto it = s.find("pressedKey"); it != s.end()) setPressedKey(it->second);
+    }
+private:
+    int pressedRow_{ -1 };
+    int pressedColumn_{ -1 };
+};
+
+
+
 // wire model, orthogonal routing, wire lookup, add, remove and reroute
 
 class Wire {
