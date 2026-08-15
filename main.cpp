@@ -3465,3 +3465,588 @@ private:
     std::unordered_map<WireId, int> wireLogicValues_;
     std::vector<std::string> messages_;
 };
+//Snapshot-based undo/redo (Command semantics over complete document state)
+class HistoryManager {
+public:
+    explicit HistoryManager(CircuitDocument* document) : document_(document) {}
+
+    void reset() { undo_.clear(); redo_.clear(); pendingBefore_.reset(); }
+    void begin(const std::string& description) {
+        if (!document_ || pendingBefore_) return;
+        pendingBefore_ = document_->serializeToString();
+        pendingDescription_ = description;
+    }
+    void commit() {
+        if (!document_ || !pendingBefore_) return;
+        const std::string after = document_->serializeToString();
+        if (after != *pendingBefore_) { undo_.push_back({ pendingDescription_, *pendingBefore_, after }); if (undo_.size() > 100) undo_.erase(undo_.begin()); redo_.clear(); }
+        pendingBefore_.reset(); pendingDescription_.clear();
+    }
+    void cancel() { pendingBefore_.reset(); pendingDescription_.clear(); }
+    bool canUndo() const { return !undo_.empty(); }
+    bool canRedo() const { return !redo_.empty(); }
+    std::string undoDescription() const { return canUndo() ? undo_.back().description : std::string(); }
+    std::string redoDescription() const { return canRedo() ? redo_.back().description : std::string(); }
+    bool undo(std::string& error) {
+        if (!document_ || undo_.empty()) return false;
+        Entry entry = undo_.back();
+        undo_.pop_back();
+        if (!document_->deserializeFromString(entry.before, error)) return false;
+        redo_.push_back(std::move(entry));
+        return true;
+    }
+    bool redo(std::string& error) {
+        if (!document_ || redo_.empty()) return false;
+        Entry entry = redo_.back();
+        redo_.pop_back();
+        if (!document_->deserializeFromString(entry.after, error)) return false;
+        undo_.push_back(std::move(entry));
+        return true;
+    }
+private:
+    struct Entry { std::string description, before, after; };
+    CircuitDocument* document_{ nullptr };
+    std::vector<Entry> undo_, redo_;
+    std::optional<std::string> pendingBefore_;
+    std::string pendingDescription_;
+};
+//SDL2 user interface
+static bool pointInRect(int x, int y, const SDL_Rect& rect) {
+    return x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h;
+}
+
+static void fillRect(SDL_Renderer* renderer, SDL_Rect rect, Color color) {
+    setRenderColor(renderer, color); SDL_RenderFillRect(renderer, &rect);
+}
+
+static void outlineRect(SDL_Renderer* renderer, SDL_Rect rect, Color color) {
+    setRenderColor(renderer, color); SDL_RenderDrawRect(renderer, &rect);
+}
+
+struct UiButton {
+    SDL_Rect rect{};
+    std::string label;
+    bool enabled{ true };
+    bool active{ false };
+};
+
+static void drawButton(SDL_Renderer* renderer, TextRenderer& text, const UiButton& button,
+    int mouseX, int mouseY, int fontSize = 13) {
+    const bool hovered = button.enabled && pointInRect(mouseX, mouseY, button.rect);
+    Color fill = button.active ? Color{ 36, 132, 172, 255 } : (hovered ? Color{ 68, 75, 88, 255 } : Palette::Panel2);
+    if (!button.enabled) fill = Color{ 45, 48, 55, 255 };
+    fillRect(renderer, button.rect, fill);
+    outlineRect(renderer, button.rect, button.active ? Palette::Accent : Color{ 85, 92, 104, 255 });
+    auto [tw, th] = text.measure(button.label, fontSize);
+    text.draw(button.label, button.rect.x + (button.rect.w - tw) / 2,
+        button.rect.y + (button.rect.h - th) / 2,
+        button.enabled ? Palette::Text : Color{ 105, 110, 120, 255 }, fontSize);
+}
+
+struct RecentProject {
+    std::string path;
+    std::string timestamp;
+};
+
+enum class EditorMode { Select, Place, Wire, Junction, Probe };
+enum class ScreenState { StartMenu, Editor };
+enum class ModalKind { None, NewProject, FileDialog, Help, About, Scope };
+enum class FileOperation { OpenProject, SaveProject, ExportImage, LoadFirmware };
+
+struct FileDialogData {
+    FileOperation operation{ FileOperation::OpenProject };
+    fs::path directory;
+    std::vector<fs::directory_entry> entries;
+    int scroll{ 0 };
+    int selected{ -1 };
+    std::string pathText;
+    bool editingPath{ false };
+    Uint32 lastClickTime{ 0 };
+    int lastClickIndex{ -1 };
+};
+
+struct NewProjectData {
+    std::string name{ "Untitled" };
+    std::string width{ "1600" };
+    std::string height{ "1000" };
+    int activeField{ 0 };
+};
+
+struct PropertyRow {
+    PropertyDescriptor descriptor;
+    SDL_Rect rect{};
+};
+
+class ProteusApp {
+public:
+    ProteusApp() : simulation_(&document_), history_(&document_) {}
+    ~ProteusApp() { shutdown(); }
+
+    bool initialize() {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+            std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n"; return false;
+        }
+        if (TTF_Init() != 0) {
+            std::cerr << "TTF_Init failed: " << TTF_GetError() << "\n"; return false;
+        }
+        window_ = SDL_CreateWindow("ProteusClone SDL2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+            1440, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        if (!window_) { std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n"; return false; }
+        renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
+        if (!renderer_) renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_TARGETTEXTURE);
+        if (!renderer_) { std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << "\n"; return false; }
+        SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
+        fonts_.initialize(); text_ = std::make_unique<TextRenderer>(renderer_, &fonts_);
+        SDL_StartTextInput(); loadRecentProjects();
+        categoryCollapsed_[ComponentCategory::Sources] = false;
+        categoryCollapsed_[ComponentCategory::Passive] = false;
+        categoryCollapsed_[ComponentCategory::Interactive] = false;
+        categoryCollapsed_[ComponentCategory::Digital] = false;
+        categoryCollapsed_[ComponentCategory::Advanced] = false;
+        categoryCollapsed_[ComponentCategory::Peripheral] = false;
+        categoryCollapsed_[ComponentCategory::Measurement] = false;
+        return true;
+    }
+
+    int run() {
+        if (!window_ || !renderer_) return 1;
+        bool running = true;
+        Uint64 previousCounter = SDL_GetPerformanceCounter();
+        while (running) {
+            SDL_Event event;
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) { running = false; break; }
+                handleEvent(event, running);
+            }
+            const Uint64 now = SDL_GetPerformanceCounter();
+            const double elapsed = static_cast<double>(now - previousCounter) / SDL_GetPerformanceFrequency();
+            previousCounter = now;
+            simulation_.update(elapsed);
+            render();
+        }
+        return 0;
+    }
+
+private:
+    // Lifecycle and layout
+    void shutdown() {
+        SDL_StopTextInput(); text_.reset(); fonts_.clear();
+        if (renderer_) { SDL_DestroyRenderer(renderer_); renderer_ = nullptr; }
+        if (window_) { SDL_DestroyWindow(window_); window_ = nullptr; }
+        if (TTF_WasInit()) TTF_Quit();
+        SDL_Quit();
+    }
+
+    void updateLayout() {
+        SDL_GetRendererOutputSize(renderer_, &windowWidth_, &windowHeight_);
+        toolbarRect_ = { 0, 0, windowWidth_, 48 };
+        statusRect_ = { 0, windowHeight_ - 25, windowWidth_, 25 };
+        libraryRect_ = { 0, 48, 260, windowHeight_ - 48 - 25 };
+        propertiesRect_ = { windowWidth_ - 300, 48, 300, windowHeight_ - 48 - 25 };
+        logRect_ = { 260, windowHeight_ - 185, windowWidth_ - 260 - 300, 160 };
+        canvasRect_ = { 260, 48, windowWidth_ - 260 - 300, windowHeight_ - 48 - 25 - 160 };
+        if (canvasRect_.w < 200) canvasRect_.w = 200;
+        if (canvasRect_.h < 150) canvasRect_.h = 150;
+        camera_.viewport = canvasRect_;
+    }
+
+    // Recent projects and notifications
+    fs::path recentConfigPath() const {
+#ifdef _WIN32
+        char* appData = nullptr;
+        std::size_t length = 0;
+
+        if (_dupenv_s(&appData, &length, "APPDATA") == 0 && appData != nullptr) {
+            fs::path result =
+                fs::path(appData) / ".proteusclone_sdl2_recent";
+
+            std::free(appData);
+            return result;
+        }
+
+        if (appData != nullptr) {
+            std::free(appData);
+        }
+
+        return fs::path(".proteusclone_sdl2_recent");
+#else
+        const char* home = std::getenv("HOME");
+
+        return home
+            ? fs::path(home) / ".proteusclone_sdl2_recent"
+            : fs::path(".proteusclone_sdl2_recent");
+#endif
+    }
+
+    void loadRecentProjects() {
+        recentProjects_.clear(); std::ifstream in(recentConfigPath()); std::string path, timestamp;
+        while (in >> std::quoted(path) >> std::quoted(timestamp)) if (fs::exists(path)) recentProjects_.push_back({ path, timestamp });
+        if (recentProjects_.size() > 5) recentProjects_.resize(5);
+    }
+
+    void saveRecentProjects() {
+        std::ofstream out(recentConfigPath(), std::ios::trunc);
+        for (const auto& recent : recentProjects_) out << std::quoted(recent.path) << ' ' << std::quoted(recent.timestamp) << "\n";
+    }
+
+    void addRecentProject(const std::string& path) {
+        recentProjects_.erase(std::remove_if(recentProjects_.begin(), recentProjects_.end(), [&](const RecentProject& r) { return r.path == path; }), recentProjects_.end());
+        recentProjects_.insert(recentProjects_.begin(), { path, nowTimestamp() }); if (recentProjects_.size() > 5) recentProjects_.resize(5); saveRecentProjects();
+    }
+
+    void notify(std::string message, Color color = Palette::Accent2) {
+        notifications_.push_front({ std::move(message), color, SDL_GetTicks() }); if (notifications_.size() > 5) notifications_.pop_back();
+    }
+
+    void appendLog(const std::string& message) {
+        if (!message.empty() && (logs_.empty() || logs_.back() != message)) logs_.push_back(message);
+        while (logs_.size() > 200) logs_.pop_front();
+    }
+    // File/new project operations
+    void newProject(int width, int height, const std::string& name) {
+        simulation_.stop(); document_.clear(); document_.setProjectName(name.empty() ? "Untitled" : name); document_.setCanvasSize(width, height); document_.setModified(false);
+        history_.reset(); currentFile_.clear(); clearSelection(); screen_ = ScreenState::Editor; mode_ = EditorMode::Select;
+        camera_.zoom = 1.0; camera_.pan = { 40, 40 }; logs_.clear(); appendLog("New project created: " + document_.projectName());
+        notify("New project created");
+    }
+
+    bool openProject(const std::string& path) {
+        std::string error; simulation_.stop();
+        if (!document_.loadFromFile(path, error)) { notify(error, Palette::Error); appendLog(error); return false; }
+        currentFile_ = path; addRecentProject(path); history_.reset(); clearSelection(); screen_ = ScreenState::Editor; mode_ = EditorMode::Select;
+        camera_.zoom = 1.0; camera_.pan = { 40, 40 }; logs_.clear(); appendLog("Loaded project: " + path); notify("Project loaded"); return true;
+    }
+
+    bool saveProject(const std::string& path) {
+        std::string error;
+        if (!document_.saveToFile(path, error)) { notify(error, Palette::Error); appendLog(error); return false; }
+        currentFile_ = path; addRecentProject(path); notify("Project saved"); appendLog("Saved: " + path); return true;
+    }
+
+    void openFileDialog(FileOperation operation) {
+        modal_ = ModalKind::FileDialog; fileDialog_ = {};
+        fileDialog_.operation = operation;
+        try { fileDialog_.directory = currentFile_.empty() ? fs::current_path() : fs::path(currentFile_).parent_path(); }
+        catch (...) { fileDialog_.directory = fs::current_path(); }
+        if (operation == FileOperation::SaveProject) fileDialog_.pathText = currentFile_.empty() ? (document_.projectName() + ".pcsdl") : currentFile_;
+        else if (operation == FileOperation::ExportImage) fileDialog_.pathText = document_.projectName() + ".bmp";
+        refreshFileEntries();
+    }
+
+    void refreshFileEntries() {
+        fileDialog_.entries.clear(); fileDialog_.selected = -1; fileDialog_.scroll = 0;
+        try {
+            for (const auto& entry : fs::directory_iterator(fileDialog_.directory)) fileDialog_.entries.push_back(entry);
+            std::sort(fileDialog_.entries.begin(), fileDialog_.entries.end(), [](const auto& a, const auto& b) {
+                if (a.is_directory() != b.is_directory()) return a.is_directory() > b.is_directory();
+                return toLower(a.path().filename().string()) < toLower(b.path().filename().string());
+                });
+        }
+        catch (const std::exception& exception) { notify(exception.what(), Palette::Error); }
+    }
+
+    void confirmFileDialog() {
+        fs::path selectedPath;
+        if (!fileDialog_.pathText.empty()) {
+            selectedPath = fs::path(fileDialog_.pathText); if (selectedPath.is_relative()) selectedPath = fileDialog_.directory / selectedPath;
+        }
+        else if (fileDialog_.selected >= 0 && fileDialog_.selected < static_cast<int>(fileDialog_.entries.size())) selectedPath = fileDialog_.entries[fileDialog_.selected].path();
+        if (selectedPath.empty()) return;
+        if (fs::is_directory(selectedPath)) { fileDialog_.directory = selectedPath; fileDialog_.pathText.clear(); refreshFileEntries(); return; }
+        bool close = true;
+        switch (fileDialog_.operation) {
+        case FileOperation::OpenProject: close = openProject(selectedPath.string()); break;
+        case FileOperation::SaveProject: close = saveProject(selectedPath.string()); break;
+        case FileOperation::ExportImage: close = exportCanvasBmp(selectedPath.string()); break;
+        case FileOperation::LoadFirmware: {
+            auto selected = singleSelectedComponent(); auto mcu = std::dynamic_pointer_cast<Microcontroller>(selected);
+            if (!mcu) { notify("Select a Microcontroller first.", Palette::Warning); close = false; break; }
+            std::string error; history_.begin("Load MCU firmware");
+            if (mcu->loadIntelHex(selectedPath.string(), error)) { history_.commit(); notify("Firmware loaded"); appendLog("Loaded firmware: " + selectedPath.string()); }
+            else { history_.cancel(); notify(error, Palette::Error); appendLog(error); close = false; }
+            break;
+        }
+        }
+        if (close) modal_ = ModalKind::None;
+    }
+
+    bool exportCanvasBmp(std::string path) {
+        if (toLower(fs::path(path).extension().string()) != ".bmp") path += ".bmp";
+        const int width = clampValue(document_.canvasWidth(), 400, 4096);
+        const int height = clampValue(document_.canvasHeight(), 300, 4096);
+        SDL_Texture* target = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, width, height);
+        if (!target) { notify(std::string("Export texture failed: ") + SDL_GetError(), Palette::Error); return false; }
+        SDL_Texture* previous = SDL_GetRenderTarget(renderer_); SDL_SetRenderTarget(renderer_, target);
+        Camera exportCamera; exportCamera.viewport = { 0, 0, width, height };
+        const double scaleX = width / static_cast<double>(document_.canvasWidth()); const double scaleY = height / static_cast<double>(document_.canvasHeight());
+        exportCamera.zoom = std::min(scaleX, scaleY); exportCamera.pan = { 0, 0 };
+        renderCanvasContent(exportCamera, true, false);
+        SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+        bool ok = surface && SDL_RenderReadPixels(renderer_, nullptr, SDL_PIXELFORMAT_ARGB8888, surface->pixels, surface->pitch) == 0 && SDL_SaveBMP(surface, path.c_str()) == 0;
+        if (surface) SDL_FreeSurface(surface);
+        SDL_SetRenderTarget(renderer_, previous);
+        SDL_DestroyTexture(target);
+        if (ok) { notify("Canvas exported to BMP"); appendLog("Exported image: " + path); }
+        else notify(std::string("Export failed: ") + SDL_GetError(), Palette::Error);
+        return ok;
+    }
+
+    // Event dispatch
+    void handleEvent(const SDL_Event& event, bool& running) {
+        if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) updateLayout();
+        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
+            if (modal_ != ModalKind::None) { modal_ = ModalKind::None; return; }
+            if (contextMenuOpen_) { contextMenuOpen_ = false; return; }
+            if (wireStart_) { cancelWire(); return; }
+            if (screen_ == ScreenState::Editor) { mode_ = EditorMode::Select; return; }
+        }
+        if (modal_ != ModalKind::None) { handleModalEvent(event); return; }
+        if (screen_ == ScreenState::StartMenu) { handleStartMenuEvent(event, running); return; }
+        handleEditorEvent(event, running);
+    }
+
+    void handleStartMenuEvent(const SDL_Event& event, bool& running) {
+        if (event.type == SDL_KEYDOWN) {
+            if (event.key.keysym.sym == SDLK_n) { modal_ = ModalKind::NewProject; newProjectData_ = {}; }
+            if (event.key.keysym.sym == SDLK_o) openFileDialog(FileOperation::OpenProject);
+            if (event.key.keysym.sym == SDLK_q) running = false;
+        }
+        if (event.type != SDL_MOUSEBUTTONDOWN || event.button.button != SDL_BUTTON_LEFT) return;
+        const int x = event.button.x, y = event.button.y;
+        SDL_Rect newButton{ windowWidth_ / 2 - 210, 280, 200, 48 };
+        SDL_Rect openButton{ windowWidth_ / 2 + 10, 280, 200, 48 };
+        if (pointInRect(x, y, newButton)) { modal_ = ModalKind::NewProject; newProjectData_ = {}; return; }
+        if (pointInRect(x, y, openButton)) { openFileDialog(FileOperation::OpenProject); return; }
+        int ry = 390;
+        for (const auto& recent : recentProjects_) {
+            SDL_Rect row{ windowWidth_ / 2 - 360, ry, 720, 46 };
+            if (pointInRect(x, y, row)) { openProject(recent.path); return; }
+            ry += 52;
+        }
+    }
+
+    void handleEditorEvent(const SDL_Event& event, bool& running) {
+        const bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
+        const bool shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+        if (event.type == SDL_KEYDOWN) {
+            const SDL_Keycode key = event.key.keysym.sym;
+            if (ctrl && key == SDLK_n) { modal_ = ModalKind::NewProject; newProjectData_ = {}; return; }
+            if (ctrl && key == SDLK_o) { openFileDialog(FileOperation::OpenProject); return; }
+            if (ctrl && key == SDLK_s) { if (currentFile_.empty()) openFileDialog(FileOperation::SaveProject); else saveProject(currentFile_); return; }
+            if (ctrl && key == SDLK_e) { openFileDialog(FileOperation::ExportImage); return; }
+            if (ctrl && key == SDLK_z) { std::string error; simulation_.pause(); if (!history_.undo(error) && !error.empty()) notify(error, Palette::Error); clearSelection(); return; }
+            if (ctrl && (key == SDLK_y || (shift && key == SDLK_z))) { std::string error; simulation_.pause(); if (!history_.redo(error) && !error.empty()) notify(error, Palette::Error); clearSelection(); return; }
+            if (ctrl && key == SDLK_q) { running = false; return; }
+            if (key == SDLK_F1) { modal_ = ModalKind::Help; return; }
+            if (key == SDLK_F5) { simulation_.start(); notify("Simulation running"); return; }
+            if (key == SDLK_F6) { simulation_.pause(); notify("Simulation paused"); return; }
+            if (key == SDLK_F7) { simulation_.stop(); notify("Simulation stopped"); return; }
+            if (key == SDLK_F8) { simulation_.step(); notify("Simulation stepped"); return; }
+            if (propertyEditing_) { handlePropertyKey(event.key); return; }
+            if (searchFocused_) { handleSearchKey(event.key); return; }
+            if (key == SDLK_DELETE || key == SDLK_BACKSPACE) { deleteSelection(); return; }
+            if (key == SDLK_r) { transformSelection("Rotate", [](Component& c) { c.rotate90(); }); return; }
+            if (key == SDLK_h) { transformSelection("Mirror horizontal", [](Component& c) { c.mirrorHorizontal(); }); return; }
+            if (key == SDLK_v) { transformSelection("Mirror vertical", [](Component& c) { c.mirrorVertical(); }); return; }
+            if (key == SDLK_w) { mode_ = EditorMode::Wire; cancelWire(); return; }
+            if (key == SDLK_s && !ctrl) { mode_ = EditorMode::Select; return; }
+            if (key == SDLK_j) { mode_ = EditorMode::Junction; return; }
+            if (key == SDLK_p) { mode_ = EditorMode::Probe; return; }
+            if (key == SDLK_g) { runDRC(); return; }
+            if (key == SDLK_o && !ctrl) { if (std::dynamic_pointer_cast<Oscilloscope>(singleSelectedComponent())) modal_ = ModalKind::Scope; return; }
+            if (key == SDLK_SPACE) spaceHeld_ = true;
+        }
+        if (event.type == SDL_KEYUP && event.key.keysym.sym == SDLK_SPACE) spaceHeld_ = false;
+        if (event.type == SDL_TEXTINPUT) {
+            if (propertyEditing_) propertyEditBuffer_ += event.text.text;
+            else if (searchFocused_) searchText_ += event.text.text;
+        }
+        if (event.type == SDL_MOUSEMOTION) handleEditorMouseMotion(event.motion);
+        if (event.type == SDL_MOUSEWHEEL) handleEditorMouseWheel(event.wheel);
+        if (event.type == SDL_MOUSEBUTTONDOWN) handleEditorMouseDown(event.button);
+        if (event.type == SDL_MOUSEBUTTONUP) handleEditorMouseUp(event.button);
+    }
+
+    void handleModalEvent(const SDL_Event& event) {
+        if (modal_ == ModalKind::Help || modal_ == ModalKind::About || modal_ == ModalKind::Scope) {
+            if (event.type == SDL_KEYDOWN && (event.key.keysym.sym == SDLK_RETURN || event.key.keysym.sym == SDLK_ESCAPE)) modal_ = ModalKind::None;
+            if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+                SDL_Rect close{ windowWidth_ / 2 + 370, 80, 30, 30 }; if (pointInRect(event.button.x, event.button.y, close)) modal_ = ModalKind::None;
+            }
+            return;
+        }
+        if (modal_ == ModalKind::NewProject) { handleNewProjectModal(event); return; }
+        if (modal_ == ModalKind::FileDialog) { handleFileDialogModal(event); return; }
+    }
+
+    void handleNewProjectModal(const SDL_Event& event) {
+        if (event.type == SDL_TEXTINPUT) {
+            std::string* target = newProjectData_.activeField == 0 ? &newProjectData_.name : (newProjectData_.activeField == 1 ? &newProjectData_.width : &newProjectData_.height);
+            *target += event.text.text;
+        }
+        if (event.type == SDL_KEYDOWN) {
+            if (event.key.keysym.sym == SDLK_TAB) newProjectData_.activeField = (newProjectData_.activeField + 1) % 3;
+            if (event.key.keysym.sym == SDLK_BACKSPACE) {
+                std::string* target = newProjectData_.activeField == 0 ? &newProjectData_.name : (newProjectData_.activeField == 1 ? &newProjectData_.width : &newProjectData_.height);
+                if (!target->empty()) target->pop_back();
+            }
+            if (event.key.keysym.sym == SDLK_RETURN) {
+                try { newProject(std::stoi(newProjectData_.width), std::stoi(newProjectData_.height), newProjectData_.name); modal_ = ModalKind::None; }
+                catch (...) { notify("Invalid canvas dimensions.", Palette::Error); }
+            }
+        }
+        if (event.type != SDL_MOUSEBUTTONDOWN || event.button.button != SDL_BUTTON_LEFT) return;
+        const int x = event.button.x, y = event.button.y;
+        const int cx = windowWidth_ / 2, cy = windowHeight_ / 2;
+        SDL_Rect name{ cx - 200, cy - 100, 400, 34 }, width{ cx - 200, cy - 52, 190, 34 }, height{ cx + 10, cy - 52, 190, 34 };
+        if (pointInRect(x, y, name)) newProjectData_.activeField = 0;
+        else if (pointInRect(x, y, width)) newProjectData_.activeField = 1;
+        else if (pointInRect(x, y, height)) newProjectData_.activeField = 2;
+        SDL_Rect a4{ cx - 200, cy + 4, 120, 34 }, a3{ cx - 65, cy + 4, 120, 34 }, hd{ cx + 70, cy + 4, 130, 34 };
+        if (pointInRect(x, y, a4)) { newProjectData_.width = "1120"; newProjectData_.height = "800"; }
+        if (pointInRect(x, y, a3)) { newProjectData_.width = "1600"; newProjectData_.height = "1120"; }
+        if (pointInRect(x, y, hd)) { newProjectData_.width = "1920"; newProjectData_.height = "1080"; }
+        SDL_Rect create{ cx + 20, cy + 65, 180, 42 }, cancel{ cx - 200, cy + 65, 180, 42 };
+        if (pointInRect(x, y, cancel)) modal_ = ModalKind::None;
+        if (pointInRect(x, y, create)) {
+            try { newProject(std::stoi(newProjectData_.width), std::stoi(newProjectData_.height), newProjectData_.name); modal_ = ModalKind::None; }
+            catch (...) { notify("Invalid canvas dimensions.", Palette::Error); }
+        }
+    }
+
+    void handleFileDialogModal(const SDL_Event& event) {
+        if (event.type == SDL_TEXTINPUT && fileDialog_.editingPath) fileDialog_.pathText += event.text.text;
+        if (event.type == SDL_KEYDOWN) {
+            if (event.key.keysym.sym == SDLK_BACKSPACE && fileDialog_.editingPath && !fileDialog_.pathText.empty()) fileDialog_.pathText.pop_back();
+            if (event.key.keysym.sym == SDLK_RETURN) confirmFileDialog();
+            if (event.key.keysym.sym == SDLK_UP && fileDialog_.selected > 0) --fileDialog_.selected;
+            if (event.key.keysym.sym == SDLK_DOWN && fileDialog_.selected + 1 < static_cast<int>(fileDialog_.entries.size())) ++fileDialog_.selected;
+        }
+        if (event.type == SDL_MOUSEWHEEL) fileDialog_.scroll = clampValue(fileDialog_.scroll - event.wheel.y * 3, 0, std::max(0, static_cast<int>(fileDialog_.entries.size()) - 12));
+        if (event.type != SDL_MOUSEBUTTONDOWN || event.button.button != SDL_BUTTON_LEFT) return;
+        const int cx = windowWidth_ / 2, cy = windowHeight_ / 2;
+        SDL_Rect pathField{ cx - 360, cy - 255, 720, 34 };
+        if (pointInRect(event.button.x, event.button.y, pathField)) { fileDialog_.editingPath = true; return; }
+        fileDialog_.editingPath = false;
+        SDL_Rect up{ cx - 360, cy - 210, 80, 30 };
+        if (pointInRect(event.button.x, event.button.y, up)) { if (fileDialog_.directory.has_parent_path()) { fileDialog_.directory = fileDialog_.directory.parent_path(); refreshFileEntries(); } return; }
+        int y = cy - 170;
+        for (int row = 0; row < 12; ++row, y += 32) {
+            const int index = fileDialog_.scroll + row; if (index >= static_cast<int>(fileDialog_.entries.size())) break;
+            SDL_Rect r{ cx - 360, y, 720, 30 };
+            if (pointInRect(event.button.x, event.button.y, r)) {
+                const Uint32 now = SDL_GetTicks(); const bool doubleClick = fileDialog_.lastClickIndex == index && now - fileDialog_.lastClickTime < 450;
+                fileDialog_.selected = index; fileDialog_.pathText = fileDialog_.entries[index].path().filename().string();
+                fileDialog_.lastClickIndex = index; fileDialog_.lastClickTime = now;
+                if (doubleClick) { if (fileDialog_.entries[index].is_directory()) { fileDialog_.directory = fileDialog_.entries[index].path(); fileDialog_.pathText.clear(); refreshFileEntries(); } else confirmFileDialog(); }
+                return;
+            }
+        }
+        SDL_Rect confirm{ cx + 180, cy + 225, 180, 40 }, cancel{ cx - 360, cy + 225, 180, 40 };
+        if (pointInRect(event.button.x, event.button.y, confirm)) confirmFileDialog();
+        if (pointInRect(event.button.x, event.button.y, cancel)) modal_ = ModalKind::None;
+    }
+    // Editor mouse and keyboard details
+    void handleSearchKey(const SDL_KeyboardEvent& key) {
+        if (key.keysym.sym == SDLK_BACKSPACE && !searchText_.empty()) searchText_.pop_back();
+        if (key.keysym.sym == SDLK_RETURN || key.keysym.sym == SDLK_ESCAPE) searchFocused_ = false;
+    }
+
+    void handlePropertyKey(const SDL_KeyboardEvent& key) {
+        if (key.keysym.sym == SDLK_BACKSPACE && !propertyEditBuffer_.empty()) propertyEditBuffer_.pop_back();
+        if (key.keysym.sym == SDLK_ESCAPE) { propertyEditing_ = false; return; }
+        if (key.keysym.sym == SDLK_RETURN) applyEditedProperty();
+    }
+
+    void applyEditedProperty() {
+        auto component = singleSelectedComponent();
+        if (!component || propertyEditIndex_ < 0 || propertyEditIndex_ >= static_cast<int>(propertyRows_.size())) { propertyEditing_ = false; return; }
+        const auto key = propertyRows_[propertyEditIndex_].descriptor.key;
+        try {
+            history_.begin("Edit property " + key);
+            if (component->setProperty(key, propertyEditBuffer_)) { history_.commit(); document_.setModified(true); document_.rerouteConnectedWires(); notify("Property updated"); }
+            else history_.cancel();
+        }
+        catch (const std::exception& exception) { history_.cancel(); notify(std::string("Invalid property: ") + exception.what(), Palette::Error); }
+        propertyEditing_ = false;
+    }
+
+    void handleEditorMouseDown(const SDL_MouseButtonEvent& button) {
+        mouseX_ = button.x; mouseY_ = button.y;
+        if (contextMenuOpen_ && button.button == SDL_BUTTON_LEFT) { handleContextMenuClick(button.x, button.y); return; }
+        if (button.button == SDL_BUTTON_LEFT) {
+            buildToolbarButtons();
+            for (const auto& pair : toolbarButtons_) if (pointInRect(button.x, button.y, pair.first.rect)) { executeToolbarAction(pair.second); return; }
+            if (pointInRect(button.x, button.y, libraryRect_)) { handleLibraryClick(button.x, button.y, button.clicks); return; }
+            if (pointInRect(button.x, button.y, propertiesRect_)) { handlePropertiesClick(button.x, button.y); return; }
+        }
+        if (button.button == SDL_BUTTON_RIGHT && pointInRect(button.x, button.y, libraryRect_)) {
+            handleLibraryRightClick(button.x, button.y);
+            return;
+        }
+        if (!pointInRect(button.x, button.y, canvasRect_)) return;
+        const Vec2 world = camera_.screenToWorld({ static_cast<double>(button.x), static_cast<double>(button.y) });
+
+        if (button.button == SDL_BUTTON_MIDDLE || (button.button == SDL_BUTTON_LEFT && spaceHeld_)) {
+            panning_ = true; panStartScreen_ = { static_cast<double>(button.x), static_cast<double>(button.y) }; panStartOffset_ = camera_.pan; return;
+        }
+        if (button.button == SDL_BUTTON_RIGHT) {
+            if (mode_ == EditorMode::Wire && wireStart_) { cancelWire(); return; }
+            auto component = document_.componentAt(world); auto wire = document_.wireAt(world, 7.0); auto junction = document_.junctionAt(world);
+            if (component) { if (!selectedComponents_.count(component->id())) { clearSelection(); selectedComponents_.insert(component->id()); } }
+            else if (wire) { clearSelection(); selectedWire_ = wire->id(); wire->setSelected(true); }
+            else if (junction) { clearSelection(); selectedJunction_ = junction->id(); junction->setSelected(true); }
+            contextMenuOpen_ = component || wire || junction; contextMenuPosition_ = { button.x, button.y }; return;
+        }
+        if (button.button != SDL_BUTTON_LEFT) return;
+
+        if (mode_ == EditorMode::Place) { placeComponent(world); return; }
+        if (mode_ == EditorMode::Wire) { handleWireClick(world); return; }
+        if (mode_ == EditorMode::Junction) { history_.begin("Add junction"); const std::size_t before = document_.junctions().size(); document_.addJunction(world); if (document_.junctions().size() != before) { history_.commit(); notify("Junction added"); } else { history_.cancel(); notify("A junction requires at least two crossing wires.", Palette::Warning); } return; }
+        if (mode_ == EditorMode::Probe) { const double voltage = simulation_.voltageAtWorld(world); appendLog("Probe at (" + std::to_string(static_cast<int>(world.x)) + ", " + std::to_string(static_cast<int>(world.y)) + ") = " + formatDouble(voltage) + " V"); notify("Voltage: " + formatDouble(voltage) + " V"); return; }
+
+        const bool ctrl = (SDL_GetModState() & KMOD_CTRL) != 0;
+        auto component = document_.componentAt(world);
+        if (component) {
+            // Live interactions remain available while the simulator is running or paused.
+            if (auto sw = std::dynamic_pointer_cast<Switch>(component)) { history_.begin("Toggle switch"); sw->toggle(); history_.commit(); document_.setModified(true); }
+            if (auto buttonComponent = std::dynamic_pointer_cast<PushButton>(component)) { buttonComponent->setPressed(true); heldPushButton_ = buttonComponent; }
+            if (!ctrl && !selectedComponents_.count(component->id())) clearSelection();
+            if (ctrl && selectedComponents_.count(component->id())) selectedComponents_.erase(component->id()); else selectedComponents_.insert(component->id());
+            selectedWire_.reset(); selectedJunction_.reset();
+            if (selectedComponents_.count(component->id())) beginComponentDrag(world);
+            if (button.clicks >= 2) { propertyEditing_ = false; notify("Properties are shown in the right panel."); }
+            return;
+        }
+        if (auto wire = document_.wireAt(world, 7.0)) { clearSelection(); selectedWire_ = wire->id(); wire->setSelected(true); return; }
+        if (auto junction = document_.junctionAt(world)) { clearSelection(); selectedJunction_ = junction->id(); junction->setSelected(true); return; }
+        if (!ctrl) clearSelection();
+        selectingRectangle_ = true;
+        selectionStartWorld_ = world;
+        selectionEndWorld_ = world;
+    }
+
+    void handleEditorMouseMotion(const SDL_MouseMotionEvent& motion) {
+        mouseX_ = motion.x; mouseY_ = motion.y;
+        const Vec2 screen{ static_cast<double>(motion.x), static_cast<double>(motion.y) };
+        const Vec2 world = camera_.screenToWorld(screen); lastMouseWorld_ = world;
+        for (const auto& component : document_.components()) if (component) for (const auto& pin : component->pins()) if (pin) pin->highlighted = distance(world, pin->worldPosition) <= kPinHoverRadius / camera_.zoom + 3.0;
+        if (panning_) { camera_.pan = panStartOffset_ + (screen - panStartScreen_); return; }
+        if (draggingComponents_) {
+            Vec2 delta = snapToGrid(world) - snapToGrid(dragStartWorld_);
+            for (const auto& [id, original] : dragOriginalPositions_) if (auto component = document_.componentById(id)) component->moveTo(original + delta);
+            document_.rerouteConnectedWires(); document_.setModified(true); return;
+        }
+        if (selectingRectangle_) selectionEndWorld_ = world;
+        if (wireStart_) wireCurrentWorld_ = snapToGrid(world);
+    }
+
+    void handleEditorMouseUp(const SDL_MouseButtonEvent& button) {
+        if (button.button == SDL_BUTTON_MIDDLE || button.button == SDL_BUTTON_LEFT) panning_ = false;
+        if (button.button == SDL_BUTTON_LEFT && draggingComponents_) { draggingComponents_ = false; history_.commit(); dragOriginalPositions_.clear(); }
+        if (button.button == SDL_BUTTON_LEFT && selectingRectangle_) {
+            selectingRectangle_ = false; const RectD selection = normalizedRect(selectionStartWorld_, selectionEndWorld_);
+            for (const auto& component : document_.components()) if (component && selection.intersects(component->worldBounds())) selectedComponents_.insert(component->id());
+        }
+        if (button.button == SDL_BUTTON_LEFT && heldPushButton_) { heldPushButton_->setPressed(false); heldPushButton_.reset(); }
+    }
