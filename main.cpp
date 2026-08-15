@@ -668,58 +668,6 @@ private:
 
 // common drawable component. individual device classes inherit this and add domain-specific behavior/state while sharing a clean schematic symbol renderer
 
-void Component::draw(CanvasPainter& painter, bool selected) const {
-    const Color outline = selected ? Palette::Selection : Palette::DarkText;
-    painter.rect(worldBounds(), outline, false);
-    drawPins(painter);
-}
-
-class CircuitDocument {
-public:
-    void clear() {
-        components_.clear(); wires_.clear(); junctions_.clear(); nets_.clear();
-        canvasWidth_ = 1600; canvasHeight_ = 1000; projectName_ = "Untitled"; modified_ = false;
-    }
-
-    const std::vector<std::shared_ptr<Component>>& components() const { return components_; }
-    const std::vector<std::shared_ptr<Wire>>& wires() const { return wires_; }
-    const std::vector<std::shared_ptr<Junction>>& junctions() const { return junctions_; }
-    const std::vector<NetNode>& nets() const { return nets_; }
-    int canvasWidth() const { return canvasWidth_; }
-    int canvasHeight() const { return canvasHeight_; }
-    const std::string& projectName() const { return projectName_; }
-    bool modified() const { return modified_; }
-    void setModified(bool value) { modified_ = value; }
-    void setCanvasSize(int width, int height) { canvasWidth_ = clampValue(width, 400, 10000); canvasHeight_ = clampValue(height, 300, 10000); modified_ = true; }
-    void setProjectName(std::string name) { projectName_ = std::move(name); modified_ = true; }
-
-    void addComponent(std::shared_ptr<Component> component) {
-        if (!component) return;
-        components_.push_back(std::move(component));
-        modified_ = true;
-    }
-
-
-    std::shared_ptr<Component> componentById(ComponentId id) const {
-        for (const auto& c : components_) if (c && c->id() == id) return c;
-        return nullptr;
-    }
-
-    std::shared_ptr<Component> componentAt(Vec2 world) const {
-        for (auto it = components_.rbegin(); it != components_.rend(); ++it) if (*it && (*it)->hitTest(world)) return *it;
-        return nullptr;
-    }
-
-    int canvasWidth_{ 1600 };
-    int canvasHeight_{ 1000 };
-    std::string projectName_{ "Untitled" };
-    bool modified_{ false };
-    std::vector<std::shared_ptr<Component>> components_;
-    std::vector<std::shared_ptr<Wire>> wires_;
-    std::vector<std::shared_ptr<Junction>> junctions_;
-    std::vector<NetNode> nets_;
-};
-
 class GenericComponent : public Component {
 public:
     GenericComponent(std::string typeName, ComponentCategory category)
@@ -779,7 +727,57 @@ public:
         voltage_ = 9.0;
     }
 };
-
+class ClockGenerator final : public GenericComponent {
+public:
+    ClockGenerator() : GenericComponent("ClockGenerator", ComponentCategory::Sources) {
+        setLabel("CLK?");
+        addPin("OUT", PinType::Output, { 34, 0 });
+        updatePinWorldPositions();
+    }
+    void tick(double dt) {
+        if (frequency_ <= 0.0) return;
+        accumulator_ += dt;
+        const double halfPeriod = 0.5 / frequency_;
+        while (accumulator_ >= halfPeriod) {
+            accumulator_ -= halfPeriod;
+            output_ = !output_;
+        }
+    }
+    bool output() const { return output_; }
+    double frequency() const { return frequency_; }
+    void reset() { accumulator_ = 0.0; output_ = false; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false},
+                {"frequency", "Frequency (Hz)", formatDouble(frequency_), false},
+                {"output", "Current output", output_ ? "HIGH" : "LOW", true} };
+    }
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "frequency") { frequency_ = std::max(0.001, std::stod(value)); return true; }
+        return false;
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["frequency"] = formatDouble(frequency_, 12);
+        s["accumulator"] = formatDouble(accumulator_, 12);
+        s["output"] = output_ ? "1" : "0";
+        return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        if (auto it = s.find("frequency"); it != s.end()) frequency_ = std::stod(it->second);
+        if (auto it = s.find("accumulator"); it != s.end()) accumulator_ = std::stod(it->second);
+        if (auto it = s.find("output"); it != s.end()) output_ = it->second == "1";
+    }
+    std::string compactStatus() const override {
+        return formatDouble(frequency_) + " Hz  " + (output_ ? "HIGH" : "LOW");
+    }
+private:
+    double frequency_{ 1.0 };
+    double accumulator_{ 0.0 };
+    bool output_{ false };
+};
+// Passive and interactive components
 class Resistor final : public GenericComponent {
 public:
     Resistor() : GenericComponent("Resistor", ComponentCategory::Passive) {
@@ -1832,56 +1830,6 @@ private:
     std::unordered_map<ComponentId, double> inductorCurrentHistory_;
     std::unordered_map<WireId, int> wireLogicValues_;
 
-class ClockGenerator final : public GenericComponent {
-public:
-    ClockGenerator() : GenericComponent("ClockGenerator", ComponentCategory::Sources) {
-        setLabel("CLK?");
-        addPin("OUT", PinType::Output, { 34, 0 });
-        updatePinWorldPositions();
-    }
-    void tick(double dt) {
-        if (frequency_ <= 0.0) return;
-        accumulator_ += dt;
-        const double halfPeriod = 0.5 / frequency_;
-        while (accumulator_ >= halfPeriod) {
-            accumulator_ -= halfPeriod;
-            output_ = !output_;
-        }
-    }
-    bool output() const { return output_; }
-    double frequency() const { return frequency_; }
-    void reset() { accumulator_ = 0.0; output_ = false; }
-    std::vector<PropertyDescriptor> properties() const override {
-        return { {"label", "Label", label_, false},
-                {"frequency", "Frequency (Hz)", formatDouble(frequency_), false},
-                {"output", "Current output", output_ ? "HIGH" : "LOW", true} };
-    }
-    bool setProperty(const std::string& key, const std::string& value) override {
-        if (Component::setProperty(key, value)) return true;
-        if (key == "frequency") { frequency_ = std::max(0.001, std::stod(value)); return true; }
-        return false;
-    }
-    std::map<std::string, std::string> persistentState() const override {
-        auto s = Component::persistentState();
-        s["frequency"] = formatDouble(frequency_, 12);
-        s["accumulator"] = formatDouble(accumulator_, 12);
-        s["output"] = output_ ? "1" : "0";
-        return s;
-    }
-    void loadPersistentState(const std::map<std::string, std::string>& s) override {
-        Component::loadPersistentState(s);
-        if (auto it = s.find("frequency"); it != s.end()) frequency_ = std::stod(it->second);
-        if (auto it = s.find("accumulator"); it != s.end()) accumulator_ = std::stod(it->second);
-        if (auto it = s.find("output"); it != s.end()) output_ = it->second == "1";
-    }
-    std::string compactStatus() const override {
-        return formatDouble(frequency_) + " Hz  " + (output_ ? "HIGH" : "LOW");
-    }
-private:
-    double frequency_{ 1.0 };
-    double accumulator_{ 0.0 };
-    bool output_{ false };
-};
 
 // Passive and interactive components
 
