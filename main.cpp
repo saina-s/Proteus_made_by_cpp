@@ -1985,8 +1985,367 @@ private:
     int pressedRow_{ -1 };
     int pressedColumn_{ -1 };
 };
+// Measurement components
+class VoltageProbe final : public GenericComponent {
+public:
+    VoltageProbe() : GenericComponent("VoltageProbe", ComponentCategory::Measurement) {
+        setLabel("PRB?"); addPin("IN", PinType::Input, { 0, 24 }); updatePinWorldPositions();
+    }
+    RectD localBounds() const override { return { -24, -24, 48, 52 }; }
+    void setVoltage(double v) { voltage_ = v; }
+    double voltage() const { return voltage_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"voltage", "Measured voltage", formatDouble(voltage_) + " V", true} };
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["voltage"] = formatDouble(voltage_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s); if (auto it = s.find("voltage"); it != s.end()) voltage_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(voltage_) + " V"; }
+private:
+    double voltage_{ 0.0 };
+};
 
+class Voltmeter final : public GenericComponent {
+public:
+    Voltmeter() : GenericComponent("Voltmeter", ComponentCategory::Measurement) {
+        setLabel("VM?"); addPin("POS", PinType::Input, { -34, 0 }); addPin("NEG", PinType::Input, { 34, 0 }); updatePinWorldPositions();
+    }
+    void setReading(double value) { reading_ = value; }
+    double reading() const { return reading_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"reading", "Reading", formatDouble(reading_) + " V", true} };
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["reading"] = formatDouble(reading_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s); if (auto it = s.find("reading"); it != s.end()) reading_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(reading_) + " V"; }
+private:
+    double reading_{ 0.0 };
+};
 
+class Ammeter final : public GenericComponent {
+public:
+    Ammeter() : GenericComponent("Ammeter", ComponentCategory::Measurement) {
+        setLabel("AM?"); addPin("IN", PinType::Passive, { -34, 0 }); addPin("OUT", PinType::Passive, { 34, 0 }); updatePinWorldPositions();
+    }
+    void setReading(double value) { reading_ = value; }
+    double reading() const { return reading_; }
+    std::vector<PropertyDescriptor> properties() const override {
+        return { {"label", "Label", label_, false}, {"reading", "Reading", formatDouble(reading_) + " A", true} };
+    }
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState(); s["reading"] = formatDouble(reading_, 12); return s;
+    }
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s); if (auto it = s.find("reading"); it != s.end()) reading_ = std::stod(it->second);
+    }
+    std::string compactStatus() const override { return formatDouble(reading_) + " A"; }
+private:
+    double reading_{ 0.0 };
+};
+
+class Oscilloscope final : public GenericComponent {
+public:
+    Oscilloscope() : GenericComponent("Oscilloscope", ComponentCategory::Measurement) {
+        setLabel("OSC?");
+        addPin("CH1", PinType::Input, { -66, -14 });
+        addPin("CH2", PinType::Input, { -66, 12 });
+        addPin("GND", PinType::Ground, { -66, 34 });
+        updatePinWorldPositions();
+    }
+
+    RectD localBounds() const override { return { -70, -50, 140, 100 }; }
+
+    void pushSample(double ch1, double ch2, double time) {
+        if (!times_.empty() && time <= times_.back()) clearSamples();
+        if (!times_.empty()) sampleInterval_ = std::max(1e-6, time - times_.back());
+        times_.push_back(time);
+        ch1_.push_back(ch1);
+        ch2_.push_back(ch2);
+        trimBuffers();
+    }
+
+    void clearSamples() { times_.clear(); ch1_.clear(); ch2_.clear(); }
+    int maxSamples() const { return static_cast<int>(timePerDiv_ * 12.0 / sampleInterval_); }
+    const std::deque<double>& times() const { return times_; }
+    const std::deque<double>& ch1Samples() const { return ch1_; }
+    const std::deque<double>& ch2Samples() const { return ch2_; }
+    bool ch1Enabled() const { return ch1Enabled_; }
+    bool ch2Enabled() const { return ch2Enabled_; }
+    double ch1VoltsPerDiv() const { return ch1VoltsPerDiv_; }
+    double ch2VoltsPerDiv() const { return ch2VoltsPerDiv_; }
+    double timePerDiv() const { return timePerDiv_; }
+    double ch1Offset() const { return ch1Offset_; }
+    double ch2Offset() const { return ch2Offset_; }
+
+    std::vector<PropertyDescriptor> properties() const override {
+        return {
+            {"label", "Label", label_, false},
+            {"ch1Enabled", "CH1 enabled", ch1Enabled_ ? "true" : "false", false},
+            {"ch2Enabled", "CH2 enabled", ch2Enabled_ ? "true" : "false", false},
+            {"ch1VoltsPerDiv", "CH1 V/div", formatDouble(ch1VoltsPerDiv_), false},
+            {"ch2VoltsPerDiv", "CH2 V/div", formatDouble(ch2VoltsPerDiv_), false},
+            {"timePerDiv", "Time/div (s)", formatDouble(timePerDiv_), false},
+            {"ch1Offset", "CH1 offset", formatDouble(ch1Offset_), false},
+            {"ch2Offset", "CH2 offset", formatDouble(ch2Offset_), false},
+            {"memory", "Time window", formatDouble(timePerDiv_ * 12.0) + " s", true}
+        };
+    }
+
+    bool setProperty(const std::string& key, const std::string& value) override {
+        if (Component::setProperty(key, value)) return true;
+        if (key == "ch1Enabled") ch1Enabled_ = value == "true" || value == "1";
+        else if (key == "ch2Enabled") ch2Enabled_ = value == "true" || value == "1";
+        else if (key == "ch1VoltsPerDiv") ch1VoltsPerDiv_ = std::max(1e-6, std::stod(value));
+        else if (key == "ch2VoltsPerDiv") ch2VoltsPerDiv_ = std::max(1e-6, std::stod(value));
+        else if (key == "timePerDiv") { timePerDiv_ = std::max(1e-6, std::stod(value)); trimBuffers(); }
+        else if (key == "ch1Offset") ch1Offset_ = std::stod(value);
+        else if (key == "ch2Offset") ch2Offset_ = std::stod(value);
+        else return false;
+        return true;
+    }
+
+    std::map<std::string, std::string> persistentState() const override {
+        auto s = Component::persistentState();
+        s["ch1Enabled"] = ch1Enabled_ ? "1" : "0";
+        s["ch2Enabled"] = ch2Enabled_ ? "1" : "0";
+        s["ch1VoltsPerDiv"] = formatDouble(ch1VoltsPerDiv_, 12);
+        s["ch2VoltsPerDiv"] = formatDouble(ch2VoltsPerDiv_, 12);
+        s["timePerDiv"] = formatDouble(timePerDiv_, 12);
+        s["ch1Offset"] = formatDouble(ch1Offset_, 12);
+        s["ch2Offset"] = formatDouble(ch2Offset_, 12);
+        s["sampleInterval"] = formatDouble(sampleInterval_, 12);
+
+        auto encode = [](const std::deque<double>& values) {
+            std::ostringstream out;
+            for (double v : values) out << std::setprecision(12) << v << ',';
+            return out.str();
+            };
+        s["times"] = encode(times_);
+        s["ch1"] = encode(ch1_);
+        s["ch2"] = encode(ch2_);
+        return s;
+    }
+
+    void loadPersistentState(const std::map<std::string, std::string>& s) override {
+        Component::loadPersistentState(s);
+        auto getBool = [&](const char* key, bool& target) {
+            if (auto it = s.find(key); it != s.end()) target = it->second == "1";
+            };
+        auto getDouble = [&](const char* key, double& target) {
+            if (auto it = s.find(key); it != s.end()) target = std::stod(it->second);
+            };
+
+        getBool("ch1Enabled", ch1Enabled_);
+        getBool("ch2Enabled", ch2Enabled_);
+        getDouble("ch1VoltsPerDiv", ch1VoltsPerDiv_);
+        getDouble("ch2VoltsPerDiv", ch2VoltsPerDiv_);
+        getDouble("timePerDiv", timePerDiv_);
+        getDouble("ch1Offset", ch1Offset_);
+        getDouble("ch2Offset", ch2Offset_);
+        getDouble("sampleInterval", sampleInterval_);
+
+        auto decode = [](const std::string& value) {
+            std::deque<double> out;
+            std::stringstream ss(value);
+            std::string item;
+            while (std::getline(ss, item, ','))
+                if (!item.empty()) out.push_back(std::stod(item));
+            return out;
+            };
+
+        if (auto it = s.find("times"); it != s.end()) times_ = decode(it->second);
+        if (auto it = s.find("ch1"); it != s.end()) ch1_ = decode(it->second);
+        if (auto it = s.find("ch2"); it != s.end()) ch2_ = decode(it->second);
+
+        trimBuffers();
+    }
+
+    std::string compactStatus() const override {
+        return "Window: " + formatDouble(timePerDiv_ * 12.0) + "s";
+    }
+
+private:
+    void trimBuffers() {
+        if (times_.empty()) return;
+        const double retainWindow = timePerDiv_ * 12.0;
+        const double latestTime = times_.back();
+
+        while (!times_.empty() && (latestTime - times_.front() > retainWindow)) {
+            times_.pop_front();
+            ch1_.pop_front();
+            ch2_.pop_front();
+        }
+    }
+
+    bool ch1Enabled_{ true }, ch2Enabled_{ false };
+    double ch1VoltsPerDiv_{ 2.0 }, ch2VoltsPerDiv_{ 2.0 }, timePerDiv_{ 0.05 };
+    double ch1Offset_{ 0.0 }, ch2Offset_{ 0.0 };
+    double sampleInterval_{ 0.005 };
+
+    std::deque<double> times_, ch1_, ch2_;
+};
+
+// Component schematic rendering
+void Component::draw(CanvasPainter& painter, bool selected) const {
+    const Color outline = selected ? Palette::Selection : Palette::DarkText;
+    painter.rect(worldBounds(), outline, false);
+    drawPins(painter);
+}
+
+void GenericComponent::draw(CanvasPainter& painter, bool selected) const {
+    const Color stroke = selected ? Palette::Selection : Palette::DarkText;
+    const Color bodyFill{ 235, 238, 242, 255 };
+    auto P = [&](double x, double y) { return transformLocal({ x, y }); };
+    auto line = [&](double x1, double y1, double x2, double y2, Color c = Color{ 0, 0, 0, 0 }, int thickness = 2) {
+        if (c.a == 0) c = stroke;
+        painter.line(P(x1, y1), P(x2, y2), c, thickness);
+        };
+    auto circle = [&](double x, double y, double r, Color c, bool filled = false) { painter.circle(P(x, y), r, c, filled); };
+    auto localRect = [&](RectD r, Color c, bool filled = false, Color fill = {}) {
+        // Rectangles are rendered as transformed polylines so rotation/mirroring is correct.
+        std::vector<Vec2> points{ P(r.left(), r.top()), P(r.right(), r.top()), P(r.right(), r.bottom()), P(r.left(), r.bottom()), P(r.left(), r.top()) };
+        if (filled) {
+            // SDL_Renderer has no arbitrary polygon fill; use a conservative world bounding fill.
+            painter.rect(worldBounds(), c, true, fill);
+        }
+        painter.polyline(points, c, 2);
+        };
+    auto label = [&](const std::string& value, double x, double y, int size = 11, Color c = Color{ 0, 0, 0, 0 }) {
+        if (c.a == 0) c = stroke;
+        painter.textWorld(value, P(x, y), c, size, true);
+        };
+
+    if (type_ == "Ground") {
+        line(0, -20, 0, 0); line(-14, 0, 14, 0); line(-9, 5, 9, 5); line(-4, 10, 4, 10);
+    }
+    else if (type_ == "DCVoltageSource") {
+        line(0, -32, 0, -16); line(0, 16, 0, 32); circle(0, 0, 15, stroke, false); label("+", 0, -7, 11); label("-", 0, 8, 11);
+        label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
+    }
+    else if (type_ == "Battery") {
+        line(0, -32, 0, -12); line(0, 12, 0, 32); line(-13, -12, 13, -12); line(-8, -4, 8, -4, stroke, 3);
+        line(-13, 5, 13, 5); line(-8, 13, 8, 13, stroke, 3); label(label_, 0, -45, 11); label(compactStatus(), 0, 46, 9, Palette::Muted);
+    }
+    else if (type_ == "ClockGenerator") {
+        localRect({ -30, -20, 60, 40 }, stroke, true, bodyFill); line(-16, 5, -16, -5); line(-16, -5, -6, -5); line(-6, -5, -6, 5);
+        line(-6, 5, 5, 5); line(5, 5, 5, -5); line(5, -5, 15, -5); line(30, 0, 34, 0); label(label_, 0, -31, 10); label(compactStatus(), 0, 31, 8, Palette::Muted);
+    }
+    else if (type_ == "Resistor") {
+        line(-34, 0, -24, 0); line(24, 0, 34, 0);
+        std::vector<Vec2> zig{ P(-24, 0), P(-18, -9), P(-10, 9), P(-2, -9), P(6, 9), P(14, -9), P(24, 0) };
+        painter.polyline(zig, stroke, 2); label(label_, 0, -20, 10); label(compactStatus(), 0, 21, 8, Palette::Muted);
+    }
+    else if (type_ == "Capacitor") {
+        line(-34, 0, -7, 0); line(7, 0, 34, 0); line(-7, -13, -7, 13); line(7, -13, 7, 13); label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
+    }
+    else if (type_ == "Inductor") {
+        line(-34, 0, -22, 0); line(22, 0, 34, 0);
+        for (int i = 0; i < 4; ++i) {
+            const double cx = -16.5 + i * 11.0;
+            std::vector<Vec2> arc;
+            for (int k = 0; k <= 12; ++k) { const double a = kPi + kPi * k / 12.0; arc.push_back(P(cx + 5.5 * std::cos(a), 5.5 * std::sin(a))); }
+            painter.polyline(arc, stroke, 2);
+        }
+        label(label_, 0, -23, 10); label(compactStatus(), 0, 24, 8, Palette::Muted);
+    }
+    else if (type_ == "Potentiometer") {
+        line(-36, 0, -24, 0); line(24, 0, 36, 0); localRect({ -24, -8, 48, 16 }, stroke, true, bodyFill);
+        const auto* pot = dynamic_cast<const Potentiometer*>(this); const double wx = pot ? -20.0 + 40.0 * pot->wiper() : 0.0;
+        line(0, -30, wx, -9); line(wx, -9, wx - 4, -14); line(wx, -9, wx + 5, -12); label(label_, 0, 22, 10); label(compactStatus(), 0, 34, 8, Palette::Muted);
+    }
+    else if (type_ == "Switch" || type_ == "PushButton") {
+        const bool active = type_ == "Switch" ? dynamic_cast<const Switch*>(this)->closed() : dynamic_cast<const PushButton*>(this)->pressed();
+        line(-32, 0, -12, 0); line(12, 0, 32, 0); circle(-12, 0, 3, stroke, true); circle(12, 0, 3, stroke, true);
+        line(-12, 0, 12, active ? 0 : -14, active ? Palette::Accent2 : stroke, 3); label(label_, 0, -26, 10); label(compactStatus(), 0, 24, 8, active ? Palette::Accent2 : Palette::Muted);
+    }
+    else if (type_ == "LED") {
+        const auto* led = dynamic_cast<const LED*>(this); const Color lit = led && led->on() ? led->ledColor() : Color{ 100, 45, 45, 255 };
+        line(-30, 0, -13, 0); line(13, 0, 30, 0);
+        std::vector<Vec2> tri{ P(-13, -11), P(-13, 11), P(12, 0), P(-13, -11) }; painter.polyline(tri, stroke, 2); line(12, -11, 12, 11);
+        circle(0, 0, 9, lit, true); if (led && led->on()) { line(3, -13, 12, -22, lit, 2); line(9, -12, 18, -21, lit, 2); }
+        label(label_, 0, 24, 10); label(compactStatus(), 0, 35, 8, led && led->on() ? lit : Palette::Muted);
+    }
+    else if (type_ == "SevenSegment") {
+        const auto* display = dynamic_cast<const SevenSegment*>(this); const std::uint8_t mask = display ? display->mask() : 0;
+        localRect({ -42, -36, 84, 68 }, stroke, true, Color{ 45, 35, 35, 255 });
+        const Color on{ 250, 45, 35, 255 }, off{ 85, 35, 35, 255 };
+        auto seg = [&](int bit, double x1, double y1, double x2, double y2) { line(x1, y1, x2, y2, (mask & (1u << bit)) ? on : off, 5); };
+        seg(0, -20, -27, 20, -27); seg(1, 25, -23, 25, -2); seg(2, 25, 3, 25, 24); seg(3, -20, 28, 20, 28);
+        seg(4, -25, 3, -25, 24); seg(5, -25, -23, -25, -2); seg(6, -20, 0, 20, 0); circle(35, 27, 3, (mask & 0x80) ? on : off, true);
+        label(label_, 0, -48, 10);
+    }
+    else if (auto gate = dynamic_cast<const LogicGate*>(this)) {
+        localRect({ -30, -24, 60, 48 }, stroke, true, Color{ 225, 230, 250, 255 });
+        label(gate->gateText(), 0, -6, 14); label(label_, 0, 10, 8, Palette::Muted); line(30, 0, 36, 0);
+        for (const auto& pin : pins_) if (pin && pin->name.rfind("IN", 0) == 0) line(-36, pin->localPosition.y, -30, pin->localPosition.y);
+        circle(25, 0, 4, gate->outputValid() ? (gate->output() ? Palette::WireHigh : Palette::WireLow) : Palette::Warning, true);
+    }
+    else if (type_ == "DFlipFlop") {
+        const auto* dff = dynamic_cast<const DFlipFlop*>(this); localRect({ -32, -27, 64, 54 }, stroke, true, Color{ 225, 230, 250, 255 });
+        label("D  FF", 0, -5, 12); label(label_, 0, 11, 8, Palette::Muted); line(-38, -11, -32, -11); line(-38, 12, -32, 12); line(32, -11, 38, -11); line(32, 12, 38, 12);
+        circle(27, -11, 4, dff && dff->valid() ? (dff->q() ? Palette::WireHigh : Palette::WireLow) : Palette::Warning, true);
+    }
+    else if (type_ == "SimpleADC" || type_ == "SimpleDAC") {
+        localRect({ -46, -40, 92, 80 }, stroke, true, Color{ 226, 238, 235, 255 }); label(type_ == "SimpleADC" ? "ADC" : "DAC", 0, -7, 15); label(label_, 0, 12, 9, Palette::Muted); label(compactStatus(), 0, 27, 8, Palette::Muted);
+    }
+    else if (type_ == "Microcontroller") {
+        localRect({ -50, -46, 100, 92 }, stroke, true, Color{ 42, 46, 54, 255 }); label("MCU", 0, -18, 15, Palette::Text); label(label_, 0, 0, 10, Palette::Text); label(compactStatus(), 0, 19, 8, Palette::Muted);
+    }
+    else if (type_ == "ExternalMemory") {
+        localRect({ -46, -44, 92, 88 }, stroke, true, Color{ 235, 225, 245, 255 }); label("EXT RAM", 0, -6, 13); label(label_, 0, 12, 9, Palette::Muted);
+    }
+    else if (type_ == "LCD16x2") {
+        const auto* lcd = dynamic_cast<const LCD16x2*>(this); localRect({ -62, -38, 124, 70 }, stroke, true, Color{ 25, 135, 65, 255 });
+        localRect({ -52, -27, 104, 44 }, Color{ 18, 65, 30, 255 }, true, Color{ 170, 215, 160, 255 });
+        if (lcd) { label(lcd->line1(), 0, -18, 8, Color{ 25, 70, 30, 255 }); label(lcd->line2(), 0, 1, 8, Color{ 25, 70, 30, 255 }); }
+        label(label_, 0, 28, 9, Palette::Text);
+    }
+    else if (type_ == "Keypad") {
+        const auto* keypad = dynamic_cast<const Keypad*>(this); localRect({ -50, -42, 100, 84 }, stroke, true, Color{ 55, 58, 62, 255 });
+        static const char* keys[4][4] = { {"1", "2", "3", "A"}, {"4", "5", "6", "B"}, {"7", "8", "9", "C"}, {"*", "0", "#", "D"} };
+        for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) {
+            const double x = -33 + c * 22.0, y = -27 + r * 18.0;
+            const bool pressed = keypad && keypad->pressedKey() == keys[r][c]; circle(x, y, 7, pressed ? Palette::Accent : Color{ 220, 225, 230, 255 }, true); label(keys[r][c], x, y - 5, 8, Palette::DarkText);
+        }
+    }
+    else if (type_ == "VoltageProbe") {
+        const auto* probe = dynamic_cast<const VoltageProbe*>(this); circle(0, -2, 16, stroke, false); line(0, 14, 0, 24); label("V", 0, -9, 13); label(probe ? probe->compactStatus() : "", 0, 27, 8, Palette::Muted);
+    }
+    else if (type_ == "Voltmeter" || type_ == "Ammeter") {
+        localRect({ -30, -20, 60, 40 }, stroke, true, Color{ 248, 242, 242, 255 }); line(-34, 0, -30, 0); line(30, 0, 34, 0); label(type_ == "Voltmeter" ? "V" : "A", 0, -13, 11); label(compactStatus(), 0, 2, 8, Palette::Muted); label(label_, 0, 21, 8);
+    }
+    else if (type_ == "Oscilloscope") {
+        const auto* scope = dynamic_cast<const Oscilloscope*>(this); localRect({ -60, -44, 120, 88 }, stroke, true, Color{ 15, 22, 18, 255 });
+        for (int i = -4; i <= 4; ++i) line(-48, i * 8, 48, i * 8, Color{ 45, 75, 50, 255 }, 1);
+        for (int i = -5; i <= 5; ++i) line(i * 9.6, -32, i * 9.6, 32, Color{ 45, 75, 50, 255 }, 1);
+        if (scope && scope->ch1Samples().size() > 1) {
+            auto drawTrace = [&](const std::deque<double>& samples, double vdiv, double offset, Color color) {
+                std::vector<Vec2> pts; const std::size_t n = samples.size(); const std::size_t start = n > 120 ? n - 120 : 0;
+                for (std::size_t i = start; i < n; ++i) { const double x = -48.0 + 96.0 * (i - start) / std::max<std::size_t>(1, n - start - 1); const double y = clampValue(-(samples[i] + offset) / (vdiv * 4.0) * 32.0, -32.0, 32.0); pts.push_back(P(x, y)); }
+                painter.polyline(pts, color, 2);
+                };
+            if (scope->ch1Enabled()) drawTrace(scope->ch1Samples(), scope->ch1VoltsPerDiv(), scope->ch1Offset(), Color{ 40, 250, 80, 255 });
+            if (scope->ch2Enabled()) drawTrace(scope->ch2Samples(), scope->ch2VoltsPerDiv(), scope->ch2Offset(), Color{ 250, 205, 30, 255 });
+        }
+        label(label_, 0, -52, 10);
+    }
+    else {
+        localRect(localBounds(), stroke, true, bodyFill); label(type_, 0, -5, 10); label(label_, 0, 10, 8, Palette::Muted);
+    }
+
+    if (selected) {
+        const RectD bounds = worldBounds();
+        painter.rect({ bounds.x - 4, bounds.y - 4, bounds.w + 8, bounds.h + 8 }, Palette::Selection, false);
+    }
+    drawPins(painter);
+}
 
 // wire model, orthogonal routing, wire lookup, add, remove and reroute
 
