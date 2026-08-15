@@ -1655,6 +1655,105 @@ private:
     std::vector<std::shared_ptr<Wire>> wires_;
     std::vector<std::shared_ptr<Junction>> junctions_;
 };
+//Component factory and circuit graph/document
+class ComponentFactory {
+public:
+    static ComponentFactory& instance() {
+        static ComponentFactory factory;
+        return factory;
+    }
+
+    std::shared_ptr<Component> create(const std::string& type) const {
+        auto it = creators_.find(type);
+        if (it != creators_.end()) {
+            return it->second();
+        }
+        return nullptr;
+    }
+
+private:
+    ComponentFactory() {
+        registerComponent<Ground>("Ground");
+        registerComponent<DCVoltageSource>("DCVoltageSource");
+        registerComponent<Battery>("Battery");
+        registerComponent<ClockGenerator>("ClockGenerator");
+        registerComponent<Resistor>("Resistor");
+        registerComponent<Capacitor>("Capacitor");
+        registerComponent<Inductor>("Inductor");
+        registerComponent<Potentiometer>("Potentiometer");
+        registerComponent<Switch>("Switch");
+        registerComponent<PushButton>("PushButton");
+        registerComponent<LED>("LED");
+        registerComponent<SevenSegment>("SevenSegment");
+        registerComponent<AndGate>("AndGate");
+        registerComponent<OrGate>("OrGate");
+        registerComponent<NotGate>("NotGate");
+        registerComponent<XorGate>("XorGate");
+        registerComponent<NandGate>("NandGate");
+        registerComponent<DFlipFlop>("DFlipFlop");
+        registerComponent<SimpleADC>("SimpleADC");
+        registerComponent<SimpleDAC>("SimpleDAC");
+        registerComponent<Microcontroller>("Microcontroller");
+        registerComponent<ExternalMemory>("ExternalMemory");
+        registerComponent<LCD16x2>("LCD16x2");
+        registerComponent<Keypad>("Keypad");
+        registerComponent<VoltageProbe>("VoltageProbe");
+        registerComponent<Voltmeter>("Voltmeter");
+        registerComponent<Ammeter>("Ammeter");
+        registerComponent<Oscilloscope>("Oscilloscope");
+    }
+
+    template<typename T>
+    void registerComponent(const std::string& name) {
+        creators_[name] = []() { return std::make_shared<T>(); };
+    }
+
+    std::unordered_map<std::string, std::function<std::shared_ptr<Component>()>> creators_;
+};
+
+static std::shared_ptr<Component> createComponentByType(const std::string& type) {
+    return ComponentFactory::instance().create(type);
+}
+
+struct LibraryEntry {
+    std::string type;
+    ComponentCategory category;
+    std::string description;
+};
+
+static const std::vector<LibraryEntry>& componentLibrary() {
+    static const std::vector<LibraryEntry> entries = {
+        {"Ground", ComponentCategory::Sources, "Global 0 V reference. At least one ground is required."},
+        {"DCVoltageSource", ComponentCategory::Sources, "Ideal adjustable DC source with POS and NEG terminals."},
+        {"Battery", ComponentCategory::Sources, "Battery-like DC source."},
+        {"ClockGenerator", ComponentCategory::Sources, "0/5 V square-wave digital clock."},
+        {"Resistor", ComponentCategory::Passive, "Ohmic two-terminal resistor."},
+        {"Capacitor", ComponentCategory::Passive, "Backward-Euler dynamic capacitor."},
+        {"Inductor", ComponentCategory::Passive, "Backward-Euler dynamic inductor."},
+        {"Potentiometer", ComponentCategory::Passive, "Three-terminal adjustable resistor."},
+        {"Switch", ComponentCategory::Interactive, "Persistent open/closed interactive switch."},
+        {"PushButton", ComponentCategory::Interactive, "Momentary switch: active only while held."},
+        {"LED", ComponentCategory::Interactive, "Colored LED with threshold and visual state."},
+        {"SevenSegment", ComponentCategory::Interactive, "Seven-segment display with A-G, DP and COM pins."},
+        {"AndGate", ComponentCategory::Digital, "Configurable-input AND gate with propagation delay."},
+        {"OrGate", ComponentCategory::Digital, "Configurable-input OR gate with propagation delay."},
+        {"NotGate", ComponentCategory::Digital, "Digital inverter with propagation delay."},
+        {"XorGate", ComponentCategory::Digital, "Configurable-input XOR gate with propagation delay."},
+        {"NandGate", ComponentCategory::Digital, "Configurable-input NAND gate with propagation delay."},
+        {"DFlipFlop", ComponentCategory::Digital, "Rising-edge D flip-flop with Q and Q-bar."},
+        {"SimpleADC", ComponentCategory::Advanced, "Ideal N-bit ADC with saturation and conversion delay."},
+        {"SimpleDAC", ComponentCategory::Advanced, "Ideal N-bit DAC with conversion delay."},
+        {"Microcontroller", ComponentCategory::Advanced, "Intel HEX loader and MOV/ADD/JMP/SETB/CLR bytecode MCU."},
+        {"ExternalMemory", ComponentCategory::Peripheral, "256-byte external RAM with address/data buses."},
+        {"LCD16x2", ComponentCategory::Peripheral, "HD44780-like 16x2 LCD bus model."},
+        {"Keypad", ComponentCategory::Peripheral, "Interactive 4x4 matrix keypad."},
+        {"VoltageProbe", ComponentCategory::Measurement, "Persistent voltage probe component."},
+        {"Voltmeter", ComponentCategory::Measurement, "Differential digital voltmeter."},
+        {"Ammeter", ComponentCategory::Measurement, "Series digital ammeter."},
+        {"Oscilloscope", ComponentCategory::Measurement, "Two-channel oscilloscope with independent V/div and offsets."}
+    };
+    return entries;
+}
 
 class DisjointSet {
 public:
@@ -1671,7 +1770,57 @@ private:
     std::vector<int> parent_;
     std::vector<int> rank_;
 };
+class CircuitDocument {
+public:
+    void clear() {
+        components_.clear(); wires_.clear(); junctions_.clear(); nets_.clear();
+        canvasWidth_ = 1600; canvasHeight_ = 1000; projectName_ = "Untitled"; modified_ = false;
+    }
 
+    const std::vector<std::shared_ptr<Component>>& components() const { return components_; }
+    const std::vector<std::shared_ptr<Wire>>& wires() const { return wires_; }
+    const std::vector<std::shared_ptr<Junction>>& junctions() const { return junctions_; }
+    const std::vector<NetNode>& nets() const { return nets_; }
+    int canvasWidth() const { return canvasWidth_; }
+    int canvasHeight() const { return canvasHeight_; }
+    const std::string& projectName() const { return projectName_; }
+    bool modified() const { return modified_; }
+    void setModified(bool value) { modified_ = value; }
+    void setCanvasSize(int width, int height) { canvasWidth_ = clampValue(width, 400, 10000); canvasHeight_ = clampValue(height, 300, 10000); modified_ = true; }
+    void setProjectName(std::string name) { projectName_ = std::move(name); modified_ = true; }
+
+    void addComponent(std::shared_ptr<Component> component) {
+        if (!component) return;
+        components_.push_back(std::move(component));
+        modified_ = true;
+    }
+
+    void removeComponent(ComponentId id) {
+        std::unordered_set<const Pin*> removedPins;
+        for (const auto& c : components_) if (c && c->id() == id) for (const auto& pin : c->pins()) if (pin) removedPins.insert(pin.get());
+        wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [&](const std::shared_ptr<Wire>& wire) {
+            return !wire || (wire->startPin() && removedPins.count(wire->startPin().get())) || (wire->endPin() && removedPins.count(wire->endPin().get()));
+            }), wires_.end());
+        components_.erase(std::remove_if(components_.begin(), components_.end(), [id](const auto& c) { return !c || c->id() == id; }), components_.end());
+        pruneUnusedJunctions(); modified_ = true;
+    }
+
+    bool addWire(std::shared_ptr<Wire> wire) {
+        if (!wire || !wire->startPin() || !wire->endPin() || wire->startPin() == wire->endPin()) return false;
+        for (const auto& existing : wires_) {
+            if (!existing) continue;
+            const bool same = existing->startPin() == wire->startPin() && existing->endPin() == wire->endPin();
+            const bool reverse = existing->startPin() == wire->endPin() && existing->endPin() == wire->startPin();
+            if (same || reverse) return false;
+        }
+        if (wire->path().size() < 2) wire->routeSimple();
+        wires_.push_back(std::move(wire)); modified_ = true; return true;
+    }
+
+    void removeWire(WireId id) {
+        wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [id](const auto& wire) { return !wire || wire->id() == id; }), wires_.end());
+        pruneUnusedJunctions(); modified_ = true;
+    }
     void addJunction(Vec2 position) {
         position = snapToGrid(position);
         for (const auto& junction : junctions_) if (junction && distance(junction->position(), position) < 1.0) return;
@@ -1684,10 +1833,40 @@ private:
         modified_ = true;
     }
 
+    std::shared_ptr<Component> componentById(ComponentId id) const {
+        for (const auto& c : components_) if (c && c->id() == id) return c;
+        return nullptr;
+    }
+    std::shared_ptr<Wire> wireById(WireId id) const {
+        for (const auto& w : wires_) if (w && w->id() == id) return w;
+        return nullptr;
+    }
+    std::shared_ptr<Pin> pinByReference(ComponentId componentId, const std::string& pinName) const {
+        auto component = componentById(componentId); return component ? component->pinByName(pinName) : nullptr;
+    }
 
+    std::shared_ptr<Component> componentAt(Vec2 world) const {
+        for (auto it = components_.rbegin(); it != components_.rend(); ++it) if (*it && (*it)->hitTest(world)) return *it;
+        return nullptr;
+    }
+    std::shared_ptr<Wire> wireAt(Vec2 world, double tolerance = 5.0) const {
+        for (auto it = wires_.rbegin(); it != wires_.rend(); ++it) if (*it && (*it)->hitTest(world, tolerance)) return *it;
+        return nullptr;
+    }
     std::shared_ptr<Junction> junctionAt(Vec2 world) const {
         for (auto it = junctions_.rbegin(); it != junctions_.rend(); ++it) if (*it && (*it)->hitTest(world)) return *it;
         return nullptr;
+    }
+    std::shared_ptr<Pin> pinAt(Vec2 world, double radius = kPinHoverRadius * 1.6) const {
+        std::shared_ptr<Pin> best; double bestDistance = radius;
+        for (const auto& component : components_) if (component) for (const auto& pin : component->pins()) if (pin) {
+            const double d = distance(world, pin->worldPosition); if (d <= bestDistance) { bestDistance = d; best = pin; }
+        }
+        return best;
+    }
+
+    void rerouteConnectedWires() {
+        for (auto& wire : wires_) if (wire) wire->reroutePreservingWaypoints();
     }
 
     void buildNetlist() {
@@ -1732,7 +1911,103 @@ private:
             }
         }
     }
+    std::vector<std::string> runDRC() {
+        buildNetlist();
+        std::vector<std::string> warnings;
+        bool hasGround = false;
+        for (const auto& component : components_) if (component) {
+            for (const auto& pin : component->pins()) if (pin) {
+                if (pin->type == PinType::Ground) hasGround = true;
+                if (pin->type == PinType::Input || pin->type == PinType::Bidirectional) {
+                    bool connected = false;
+                    for (const auto& wire : wires_) if (wire && (wire->startPin() == pin || wire->endPin() == pin)) { connected = true; break; }
+                    if (!connected) warnings.push_back("Floating input detected: " + component->label() + "." + pin->name);
+                }
+            }
+        }
+        if (!hasGround && !components_.empty()) warnings.push_back("No GND reference exists; analog simulation uses a temporary reference.");
+        for (const auto& net : nets_) {
+            int outputs = 0, powers = 0, grounds = 0;
+            for (const auto& pin : net.pins()) if (pin) {
+                outputs += pin->type == PinType::Output ? 1 : 0;
+                powers += pin->type == PinType::Power ? 1 : 0;
+                grounds += pin->type == PinType::Ground ? 1 : 0;
+            }
+            if (outputs + powers > 1) warnings.push_back("Possible short circuit: net " + std::to_string(net.id()) + " has multiple drivers.");
+            if (powers > 0 && grounds > 0) warnings.push_back("Short circuit: power is directly connected to ground on net " + std::to_string(net.id()) + ".");
+        }
+        if (components_.empty()) warnings.push_back("Schematic is empty: add components to simulate.");
+        return warnings;
+    }
 
+    std::string serializeToString() const {
+        std::ostringstream out;
+        out << "PROTEUS_SDL2 3\n";
+        out << "PROJECT " << std::quoted(projectName_) << ' ' << canvasWidth_ << ' ' << canvasHeight_ << "\n";
+        out << "COMPONENTS " << components_.size() << "\n";
+        for (const auto& component : components_) {
+            const auto state = component->persistentState();
+            out << "COMP " << component->id() << ' ' << std::quoted(component->type()) << ' '
+                << std::setprecision(17) << component->position().x << ' ' << component->position().y << ' '
+                << component->rotation() << ' ' << component->mirroredHorizontal() << ' ' << component->mirroredVertical() << ' '
+                << state.size() << "\n";
+            for (const auto& [key, value] : state) out << "PROP " << std::quoted(key) << ' ' << std::quoted(value) << "\n";
+        }
+        out << "WIRES " << wires_.size() << "\n";
+        for (const auto& wire : wires_) {
+            if (!wire || !wire->startPin() || !wire->endPin()) continue;
+            out << "WIRE " << wire->id() << ' ' << wire->startPin()->ownerId << ' ' << std::quoted(wire->startPin()->name) << ' '
+                << wire->endPin()->ownerId << ' ' << std::quoted(wire->endPin()->name) << ' ' << wire->manualRoute() << ' ' << wire->path().size() << "\n";
+            for (const auto& point : wire->path()) out << "POINT " << std::setprecision(17) << point.x << ' ' << point.y << "\n";
+        }
+        out << "JUNCTIONS " << junctions_.size() << "\n";
+        for (const auto& junction : junctions_) if (junction) out << "JUNCTION " << junction->id() << ' ' << junction->position().x << ' ' << junction->position().y << "\n";
+        out << "END\n";
+        return out.str();
+    }
+
+    bool deserializeFromString(const std::string& data, std::string& error) {
+        CircuitDocument loaded;
+        std::istringstream in(data);
+        std::string token; int version = 0;
+        if (!(in >> token >> version) || token != "PROTEUS_SDL2" || version < 1 || version > 3) { error = "Unsupported or invalid project file."; return false; }
+        if (!(in >> token) || token != "PROJECT") { error = "Missing PROJECT record."; return false; }
+        in >> std::quoted(loaded.projectName_) >> loaded.canvasWidth_ >> loaded.canvasHeight_;
+        std::size_t componentCount = 0; in >> token >> componentCount; if (token != "COMPONENTS") { error = "Missing COMPONENTS record."; return false; }
+        for (std::size_t i = 0; i < componentCount; ++i) {
+            ComponentId id; std::string type; double x, y; int rotation; bool mh, mv; std::size_t stateCount;
+            in >> token >> id >> std::quoted(type) >> x >> y >> rotation >> mh >> mv >> stateCount;
+            if (token != "COMP") { error = "Malformed component record."; return false; }
+            auto component = createComponentByType(type); if (!component) { error = "Unknown component type: " + type; return false; }
+            std::map<std::string, std::string> state;
+            for (std::size_t k = 0; k < stateCount; ++k) { std::string key, value; in >> token >> std::quoted(key) >> std::quoted(value); if (token != "PROP") { error = "Malformed property."; return false; } state[key] = value; }
+            component->setIdForLoad(id); component->loadPersistentState(state); component->setTransformForLoad({ x, y }, rotation, mh, mv); loaded.components_.push_back(component);
+        }
+        std::size_t wireCount = 0; in >> token >> wireCount; if (token != "WIRES") { error = "Missing WIRES record."; return false; }
+        for (std::size_t i = 0; i < wireCount; ++i) {
+            WireId id; ComponentId sc, ec; std::string sp, ep; bool manual; std::size_t pathCount;
+            in >> token >> id >> sc >> std::quoted(sp) >> ec >> std::quoted(ep) >> manual >> pathCount;
+            if (token != "WIRE") { error = "Malformed wire record."; return false; }
+            std::vector<Vec2> path;
+            for (std::size_t k = 0; k < pathCount; ++k) { Vec2 p; in >> token >> p.x >> p.y; if (token != "POINT") { error = "Malformed wire point."; return false; } path.push_back(p); }
+            auto start = loaded.pinByReference(sc, sp), end = loaded.pinByReference(ec, ep);
+            if (!start || !end) { error = "Wire endpoint refers to a missing pin."; return false; }
+            auto wire = std::make_shared<Wire>(); wire->setIdForLoad(id); wire->setPins(start, end); wire->setPath(path, manual); loaded.wires_.push_back(wire);
+        }
+        std::size_t junctionCount = 0; in >> token >> junctionCount; if (token != "JUNCTIONS") { error = "Missing JUNCTIONS record."; return false; }
+        for (std::size_t i = 0; i < junctionCount; ++i) { JunctionId id; Vec2 p; in >> token >> id >> p.x >> p.y; if (token != "JUNCTION") { error = "Malformed junction."; return false; } auto j = std::make_shared<Junction>(p); j->setIdForLoad(id); loaded.junctions_.push_back(j); }
+        in >> token; if (token != "END") { error = "Project file ended unexpectedly."; return false; }
+        loaded.modified_ = false; loaded.buildNetlist(); *this = std::move(loaded); return true;
+    }
+
+    bool saveToFile(const std::string& path, std::string& error) {
+        std::ofstream out(path, std::ios::binary); if (!out) { error = "Cannot write project file: " + path; return false; }
+        out << serializeToString(); if (!out.good()) { error = "Write failure: " + path; return false; } modified_ = false; return true;
+    }
+    bool loadFromFile(const std::string& path, std::string& error) {
+        std::ifstream in(path, std::ios::binary); if (!in) { error = "Cannot open project file: " + path; return false; }
+        std::ostringstream data; data << in.rdbuf(); return deserializeFromString(data.str(), error);
+    }
 private:
     void pruneUnusedJunctions() {
         junctions_.erase(std::remove_if(junctions_.begin(), junctions_.end(), [&](const auto& junction) {
@@ -1742,6 +2017,15 @@ private:
             return touching < 2;
             }), junctions_.end());
     }
+    int canvasWidth_{ 1600 };
+    int canvasHeight_{ 1000 };
+    std::string projectName_{ "Untitled" };
+    bool modified_{ false };
+    std::vector<std::shared_ptr<Component>> components_;
+    std::vector<std::shared_ptr<Wire>> wires_;
+    std::vector<std::shared_ptr<Junction>> junctions_;
+    std::vector<NetNode> nets_;
+};
 
 
 // simulation lifecycle, voltage lookup, analog matrix, linear solver, source/R/C stamping and solution update
