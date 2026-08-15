@@ -2029,248 +2029,327 @@ private:
 
 
 // simulation lifecycle, voltage lookup, analog matrix, linear solver, source/R/C stamping and solution update
+enum class SimulationState { Stopped, Running, Paused };
+class SimulationEngine {
+public:
+    explicit SimulationEngine(CircuitDocument* document) : document_(document) {}
 
-    enum class SimulationState { Stopped, Running, Paused };
+    SimulationState state() const { return state_; }
+    double time() const { return time_; }
+    double timeStep() const { return dt_; }
+    const std::vector<std::string>& messages() const { return messages_; }
+    const std::unordered_map<WireId, int>& wireLogicValues() const { return wireLogicValues_; }
 
-    class SimulationEngine {
-    public:
-        explicit SimulationEngine(CircuitDocument* document) : document_(document) {}
-
-        SimulationState state() const { return state_; }
-        double time() const { return time_; }
-        double timeStep() const { return dt_; }
-        const std::vector<std::string>& messages() const { return messages_; }
-        const std::unordered_map<WireId, int>& wireLogicValues() const { return wireLogicValues_; }
-
-        void start() { state_ = SimulationState::Running; accumulatorWall_ = 0.0; }
-        void pause() { state_ = SimulationState::Paused; }
-        void stop() {
-            state_ = SimulationState::Stopped; time_ = 0.0; accumulatorWall_ = 0.0;
-            netVoltages_.clear(); pinVoltages_.clear(); wireLogicValues_.clear(); capacitorVoltageHistory_.clear(); inductorCurrentHistory_.clear(); ammeterCurrent_.clear();
-
+    void start() { state_ = SimulationState::Running; accumulatorWall_ = 0.0; }
+    void pause() { state_ = SimulationState::Paused; }
+    void stop() {
+        state_ = SimulationState::Stopped; time_ = 0.0; accumulatorWall_ = 0.0;
+        netVoltages_.clear(); pinVoltages_.clear(); wireLogicValues_.clear(); capacitorVoltageHistory_.clear(); inductorCurrentHistory_.clear(); ammeterCurrent_.clear();
+        if (document_) for (const auto& component : document_->components()) {
+            if (auto clock = std::dynamic_pointer_cast<ClockGenerator>(component)) clock->reset();
+            if (auto scope = std::dynamic_pointer_cast<Oscilloscope>(component)) scope->clearSamples();
         }
+    }
 
-        void update(double elapsedSeconds) {
-            if (state_ != SimulationState::Running) return;
-            accumulatorWall_ += clampValue(elapsedSeconds, 0.0, 0.1);
-            int guard = 0;
-            while (accumulatorWall_ >= dt_ && guard++ < 10) { accumulatorWall_ -= dt_; tick(); }
+    void update(double elapsedSeconds) {
+        if (state_ != SimulationState::Running) return;
+        accumulatorWall_ += clampValue(elapsedSeconds, 0.0, 0.1);
+        int guard = 0;
+        while (accumulatorWall_ >= dt_ && guard++ < 10) { accumulatorWall_ -= dt_; tick(); }
+    }
+
+    void step() {
+        if (state_ == SimulationState::Running) return;
+        state_ = SimulationState::Paused; tick();
+    }
+
+    double voltageAtPin(const std::shared_ptr<Pin>& pin) const {
+        if (!pin) return 0.0;
+        auto it = pinVoltages_.find(pin.get());
+        if (it != pinVoltages_.end()) return it->second;
+        if (pin->net >= 0 && pin->net < static_cast<int>(netVoltages_.size())) return netVoltages_[pin->net];
+        return 0.0;
+    }
+
+    double voltageAtWorld(Vec2 world) const {
+        if (!document_) return 0.0;
+        if (auto pin = document_->pinAt(world, 12.0)) return voltageAtPin(pin);
+        if (auto wire = document_->wireAt(world, 8.0)) {
+            if (wire->startPin()) return voltageAtPin(wire->startPin());
         }
+        return 0.0;
+    }
 
-        void step() {
-            if (state_ == SimulationState::Running) return;
-            state_ = SimulationState::Paused; tick();
+    LogicState logicAtPin(const std::shared_ptr<Pin>& pin) const {
+        if (!pin || !document_ || pin->net < 0) return LogicState::Undefined;
+        return logicAtNet(pin->net);
+    }
+
+private:
+    struct Driver {
+        LogicState state{ LogicState::Undefined };
+        std::string name;
+    };
+
+    std::shared_ptr<Component> ownerOf(const std::shared_ptr<Pin>& pin) const {
+        return pin && document_ ? document_->componentById(pin->ownerId) : nullptr;
+    }
+
+    std::optional<Driver> explicitDriver(const std::shared_ptr<Pin>& pin) const {
+        if (!pin) return std::nullopt;
+        auto component = ownerOf(pin); if (!component) return std::nullopt;
+
+        if (pin->type == PinType::Ground) return Driver{ LogicState::Low, component->label() + "." + pin->name };
+        if (auto clock = std::dynamic_pointer_cast<ClockGenerator>(component)) {
+            if (pin->name == "OUT") return Driver{ clock->output() ? LogicState::High : LogicState::Low, component->label() };
         }
-
-        double voltageAtPin(const std::shared_ptr<Pin>& pin) const {
-            if (!pin) return 0.0;
-            auto it = pinVoltages_.find(pin.get());
-            if (it != pinVoltages_.end()) return it->second;
-            if (pin->net >= 0 && pin->net < static_cast<int>(netVoltages_.size())) return netVoltages_[pin->net];
-            return 0.0;
+        if (auto gate = std::dynamic_pointer_cast<LogicGate>(component)) {
+            if (pin->name == "OUT") return Driver{ gate->outputState(), component->label() };
         }
-
-        double voltageAtWorld(Vec2 world) const {
-            if (!document_) return 0.0;
-            if (auto pin = document_->pinAt(world, 12.0)) return voltageAtPin(pin);
-            if (auto wire = document_->wireAt(world, 8.0)) {
-                if (wire->startPin()) return voltageAtPin(wire->startPin());
+        if (auto flipFlop = std::dynamic_pointer_cast<DFlipFlop>(component)) {
+            if (pin->name == "Q") return Driver{ flipFlop->valid() ? (flipFlop->q() ? LogicState::High : LogicState::Low) : LogicState::Undefined, component->label() + ".Q" };
+            if (pin->name == "QB") return Driver{ flipFlop->valid() ? (!flipFlop->q() ? LogicState::High : LogicState::Low) : LogicState::Undefined, component->label() + ".QB" };
+        }
+        if (auto adc = std::dynamic_pointer_cast<SimpleADC>(component)) {
+            if (pin->name.size() > 1 && pin->name[0] == 'D') {
+                const int bit = std::stoi(pin->name.substr(1)); return Driver{ ((adc->outputCode() >> bit) & 1u) ? LogicState::High : LogicState::Low, component->label() + "." + pin->name };
             }
-            return 0.0;
         }
+        if (auto mcu = std::dynamic_pointer_cast<Microcontroller>(component)) {
+            char port = '\0'; int bit = -1; bool high = false;
+            if (Microcontroller::decodePinName(pin->name, port, bit) && mcu->drivesPortBit(port, bit, high))
+                return Driver{ high ? LogicState::High : LogicState::Low, component->label() + "." + pin->name };
+        }
+        if (auto keypad = std::dynamic_pointer_cast<Keypad>(component)) {
+            if (pin->name.size() == 2 && pin->name[0] == 'C') {
+                const int column = pin->name[1] - '1';
+                std::array<bool, 4> rowLow{};
+                for (int i = 0; i < 4; ++i) rowLow[i] = logicAtPin(component->pinByName("R" + std::to_string(i + 1))) == LogicState::Low;
+                return Driver{ keypad->columnActive(column, rowLow) ? LogicState::Low : LogicState::High, component->label() + "." + pin->name };
+            }
+        }
+        if (auto memory = std::dynamic_pointer_cast<ExternalMemory>(component)) {
+            if (memory->readActive() && pin->name.size() > 1 && pin->name[0] == 'D') {
+                const int bit = std::stoi(pin->name.substr(1)); return Driver{ ((memory->readData() >> bit) & 1u) ? LogicState::High : LogicState::Low, component->label() + "." + pin->name };
+            }
+        }
+        return std::nullopt;
+    }
 
-        struct AnalogSystem {
-            explicit AnalogSystem(const std::vector<NetNode>& nets, int groundNet)
-                : variableOfNet(nets.size(), -1) {
-                int nextVariable = 0;
-                for (const auto& net : nets) {
-                    if (net.id() == groundNet) continue;
-                    if (net.id() >= 0 && net.id() < static_cast<int>(variableOfNet.size()))
-                        variableOfNet[net.id()] = nextVariable++;
+    LogicState logicAtNet(int net) const {
+        if (!document_ || net < 0 || net >= static_cast<int>(document_->nets().size())) return LogicState::Undefined;
+        bool sawDriver = false; LogicState state = LogicState::Undefined;
+        for (const auto& pin : document_->nets()[net].pins()) {
+            auto driver = explicitDriver(pin); if (!driver) continue;
+            if (driver->state == LogicState::Undefined) return LogicState::Undefined;
+            if (!sawDriver) { state = driver->state; sawDriver = true; }
+            else if (state != driver->state) return LogicState::Undefined;
+        }
+        if (sawDriver) return state;
+        const double voltage = net < static_cast<int>(netVoltages_.size()) ? netVoltages_[net] : 0.0;
+        if (voltage <= kLogicLowMax) return LogicState::Low;
+        if (voltage >= kLogicHighMin) return LogicState::High;
+        return LogicState::Undefined;
+    }
+
+    void tickDigital() {
+        for (const auto& component : document_->components()) {
+            if (auto clock = std::dynamic_pointer_cast<ClockGenerator>(component)) clock->tick(dt_);
+            if (auto mcu = std::dynamic_pointer_cast<Microcontroller>(component)) {
+                for (char port : {'A', 'B'}) for (int bit = 0; bit < 8; ++bit) {
+                    const LogicState value = logicAtPin(component->pinByName(Microcontroller::pinName(port, bit)));
+                    if (value != LogicState::Undefined) mcu->sampleInputPortBit(port, bit, value == LogicState::High);
                 }
-                matrix.assign(nextVariable, std::vector<double>(nextVariable, 0.0));
-                rhs.assign(nextVariable, 0.0);
+                mcu->tickCpu();
             }
-
-            int variable(int net) const {
-                if (net < 0 || net >= static_cast<int>(variableOfNet.size())) return -1;
-                return variableOfNet[net];
-            }
-
-            void addConductance(int netA, int netB, double conductance) {
-                if (!std::isfinite(conductance) || conductance <= 0.0) return;
-                const double g = clampValue(conductance, 1e-12, 1e9);
-                const int a = variable(netA);
-                const int b = variable(netB);
-
-                if (a >= 0) matrix[a][a] += g;
-                if (b >= 0) matrix[b][b] += g;
-                if (a >= 0 && b >= 0) {
-                    matrix[a][b] -= g;
-                    matrix[b][a] -= g;
-                }
-            }
-
-            void addToRhs(int net, double value) {
-                const int row = variable(net);
-                if (row >= 0) rhs[row] += value;
-            }
-
-            void addCurrentSource(int fromNet, int toNet, double current) {
-                addToRhs(fromNet, -current);
-                addToRhs(toNet, current);
-            }
-
-            void addDrivenVoltage(int positiveNet, int negativeNet, double voltage) {
-                constexpr double kStrongConductance = 1e6;
-                addConductance(positiveNet, negativeNet, kStrongConductance);
-                addToRhs(positiveNet, kStrongConductance * voltage);
-                addToRhs(negativeNet, -kStrongConductance * voltage);
-            }
-
-            void regularize(double epsilon) {
-                for (std::size_t i = 0; i < matrix.size(); ++i) matrix[i][i] += epsilon;
-            }
-
-            std::vector<int> variableOfNet;
-            std::vector<std::vector<double>> matrix;
-            std::vector<double> rhs;
-        };
-
-        static bool solveLinearSystem(std::vector<std::vector<double>> matrix,
-            std::vector<double> rhs,
-            std::vector<double>& solution) {
-            const int n = static_cast<int>(rhs.size());
-            solution.assign(n, 0.0);
-            if (n == 0) return true;
-            if (static_cast<int>(matrix.size()) != n) return false;
-            for (const auto& row : matrix) if (static_cast<int>(row.size()) != n) return false;
-
-            // forward elimination with partial pivoting
-            for (int column = 0; column < n; ++column) {
-                int pivotRow = column;
-                double pivotMagnitude = std::abs(matrix[column][column]);
-
-                for (int row = column + 1; row < n; ++row) {
-                    const double candidate = std::abs(matrix[row][column]);
-                    if (candidate > pivotMagnitude) {
-                        pivotMagnitude = candidate;
-                        pivotRow = row;
-                    }
-                }
-
-                if (pivotMagnitude < 1e-14) return false;
-                if (pivotRow != column) {
-                    std::swap(matrix[pivotRow], matrix[column]);
-                    std::swap(rhs[pivotRow], rhs[column]);
-                }
-
-                const double pivot = matrix[column][column];
-                for (int row = column + 1; row < n; ++row) {
-                    const double factor = matrix[row][column] / pivot;
-                    if (std::abs(factor) < 1e-18) {
-                        matrix[row][column] = 0.0;
-                        continue;
-                    }
-
-                    matrix[row][column] = 0.0;
-                    for (int j = column + 1; j < n; ++j)
-                        matrix[row][j] -= factor * matrix[column][j];
-                    rhs[row] -= factor * rhs[column];
-                }
-            }
-
-            // back substitution
-            for (int row = n - 1; row >= 0; --row) {
-                double value = rhs[row];
-                for (int column = row + 1; column < n; ++column)
-                    value -= matrix[row][column] * solution[column];
-
-                const double diagonal = matrix[row][row];
-                if (std::abs(diagonal) < 1e-14) return false;
-                solution[row] = value / diagonal;
-            }
-            return true;
         }
 
-        void solveAnalog() {
-            const auto& nets = document_->nets();
-            if (nets.empty()) {
-                netVoltages_.clear();
-                return;
+        for (const auto& component : document_->components()) {
+            if (auto adc = std::dynamic_pointer_cast<SimpleADC>(component)) {
+                adc->setAnalogInput(voltageAtPin(component->pinByName("VIN")), voltageAtPin(component->pinByName("VREF-")), voltageAtPin(component->pinByName("VREF+")));
+                adc->tick(dt_);
             }
+            if (auto dac = std::dynamic_pointer_cast<SimpleDAC>(component)) {
+                std::uint32_t code = 0;
+                for (int bit = 0; bit < dac->bits(); ++bit) if (logicAtPin(component->pinByName("D" + std::to_string(bit))) == LogicState::High) code |= 1u << bit;
+                dac->setDigitalInput(code, voltageAtPin(component->pinByName("VREF-")), voltageAtPin(component->pinByName("VREF+")));
+                dac->tick(dt_);
+            }
+        }
 
-            int groundNet = -1;
+        for (int pass = 0; pass < 4; ++pass) {
+            for (const auto& component : document_->components()) if (auto gate = std::dynamic_pointer_cast<LogicGate>(component)) {
+                std::vector<LogicState> inputs;
+                for (int i = 0; i < gate->inputCount(); ++i) inputs.push_back(logicAtPin(component->pinByName("IN" + std::to_string(i + 1))));
+                if (std::any_of(inputs.begin(), inputs.end(), [](LogicState state) { return state == LogicState::Undefined; }))
+                    addMessageUnique("Floating input detected at " + component->label() + ".");
+                gate->evaluate(inputs, pass == 0 ? dt_ : 0.0);
+            }
+        }
+
+        for (const auto& component : document_->components()) if (auto flipFlop = std::dynamic_pointer_cast<DFlipFlop>(component)) {
+            const LogicState d = logicAtPin(component->pinByName("D")); const LogicState clk = logicAtPin(component->pinByName("CLK"));
+            if (d == LogicState::Undefined || clk == LogicState::Undefined) addMessageUnique("Floating input detected at " + component->label() + ".");
+            flipFlop->update(d, clk);
+        }
+    }
+
+    struct AnalogSystem {
+        explicit AnalogSystem(const std::vector<NetNode>& nets, int groundNet)
+            : variableOfNet(nets.size(), -1) {
+            int nextVariable = 0;
             for (const auto& net : nets) {
-                const bool containsGround = std::any_of(net.pins().begin(), net.pins().end(), [](const std::shared_ptr<Pin>& pin) {
-                    return pin && pin->type == PinType::Ground;
-                    });
-                if (containsGround) groundNet = net.id();
+                if (net.id() == groundNet) continue;
+                if (net.id() >= 0 && net.id() < static_cast<int>(variableOfNet.size()))
+                    variableOfNet[net.id()] = nextVariable++;
             }
-            if (groundNet < 0) {
-                groundNet = 0;
-                addMessageUnique("Ground reference missing. Net 0 assumed as virtual ground.");
+            matrix.assign(nextVariable, std::vector<double>(nextVariable, 0.0));
+            rhs.assign(nextVariable, 0.0);
+        }
+
+        int variable(int net) const {
+            if (net < 0 || net >= static_cast<int>(variableOfNet.size())) return -1;
+            return variableOfNet[net];
+        }
+
+        void addConductance(int netA, int netB, double conductance) {
+            if (!std::isfinite(conductance) || conductance <= 0.0) return;
+            const double g = clampValue(conductance, 1e-12, 1e9);
+            const int a = variable(netA);
+            const int b = variable(netB);
+
+            if (a >= 0) matrix[a][a] += g;
+            if (b >= 0) matrix[b][b] += g;
+            if (a >= 0 && b >= 0) {
+                matrix[a][b] -= g;
+                matrix[b][a] -= g;
+            }
+        }
+
+        void addToRhs(int net, double value) {
+            const int row = variable(net);
+            if (row >= 0) rhs[row] += value;
+        }
+
+        void addCurrentSource(int fromNet, int toNet, double current) {
+            addToRhs(fromNet, -current);
+            addToRhs(toNet, current);
+        }
+
+        void addDrivenVoltage(int positiveNet, int negativeNet, double voltage) {
+            constexpr double kStrongConductance = 1e6;
+            addConductance(positiveNet, negativeNet, kStrongConductance);
+            addToRhs(positiveNet, kStrongConductance * voltage);
+            addToRhs(negativeNet, -kStrongConductance * voltage);
+        }
+
+        void regularize(double epsilon) {
+            for (std::size_t i = 0; i < matrix.size(); ++i) matrix[i][i] += epsilon;
+        }
+
+        std::vector<int> variableOfNet;
+        std::vector<std::vector<double>> matrix;
+        std::vector<double> rhs;
+    };
+
+    static bool solveLinearSystem(std::vector<std::vector<double>> matrix,
+        std::vector<double> rhs,
+        std::vector<double>& solution) {
+        const int n = static_cast<int>(rhs.size());
+        solution.assign(n, 0.0);
+        if (n == 0) return true;
+        if (static_cast<int>(matrix.size()) != n) return false;
+        for (const auto& row : matrix) if (static_cast<int>(row.size()) != n) return false;
+
+        for (int column = 0; column < n; ++column) {
+            int pivotRow = column;
+            double pivotMagnitude = std::abs(matrix[column][column]);
+
+            for (int row = column + 1; row < n; ++row) {
+                const double candidate = std::abs(matrix[row][column]);
+                if (candidate > pivotMagnitude) {
+                    pivotMagnitude = candidate;
+                    pivotRow = row;
+                }
             }
 
-            AnalogSystem system(nets, groundNet);
-            auto netOf = [](const std::shared_ptr<Pin>& pin) { return pin ? pin->net : -1; };
+            if (pivotMagnitude < 1e-14) return false;
+            if (pivotRow != column) {
+                std::swap(matrix[pivotRow], matrix[column]);
+                std::swap(rhs[pivotRow], rhs[column]);
+            }
 
-            for (const auto& component : document_->components()) {
-                if (auto source = std::dynamic_pointer_cast<DCVoltageSource>(component)) {
-                    system.addDrivenVoltage(netOf(component->pinByName("POS")),
-                        netOf(component->pinByName("NEG")),
-                        source->voltage());
-                }
-                else if (auto resistor = std::dynamic_pointer_cast<Resistor>(component)) {
-                    const double r = std::max(1e-6, resistor->resistance());
-                    system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("B")), 1.0 / r);
-                }
-                else if (auto capacitor = std::dynamic_pointer_cast<Capacitor>(component)) {
-                    if (capacitor->capacitance() > 0.0) {
-                        const int nA = netOf(component->pinByName("A"));
-                        const int nB = netOf(component->pinByName("B"));
-                        const double eqConductance = capacitor->capacitance() / dt_;
-                        const double pastV = capacitorVoltageHistory_[component->id()];
-
-                        system.addConductance(nA, nB, eqConductance);
-                        system.addToRhs(nA, eqConductance * pastV);
-                        system.addToRhs(nB, -eqConductance * pastV);
-                    }
+            const double pivot = matrix[column][column];
+            for (int row = column + 1; row < n; ++row) {
+                const double factor = matrix[row][column] / pivot;
+                if (std::abs(factor) < 1e-18) {
+                    matrix[row][column] = 0.0;
+                    continue;
                 }
 
-                const double pivotStabilizer = 1e-10;
-                system.regularize(pivotStabilizer);
+                matrix[row][column] = 0.0;
+                for (int j = column + 1; j < n; ++j)
+                    matrix[row][j] -= factor * matrix[column][j];
+                rhs[row] -= factor * rhs[column];
+            }
+        }
 
-                std::vector<double> solution;
-                if (!solveLinearSystem(system.matrix, system.rhs, solution)) {
-                    addMessageUnique("Convergence error: Matrix solver could not find a solution.");
-                    return;
+        for (int row = n - 1; row >= 0; --row) {
+            double value = rhs[row];
+            for (int column = row + 1; column < n; ++column)
+                value -= matrix[row][column] * solution[column];
+
+            const double diagonal = matrix[row][row];
+            if (std::abs(diagonal) < 1e-14) return false;
+            solution[row] = value / diagonal;
+        }
+        return true;
+    }
+
+    void solveAnalog() {
+        const auto& nets = document_->nets();
+        if (nets.empty()) {
+            netVoltages_.clear();
+            return;
+        }
+
+        int groundNet = -1;
+        for (const auto& net : nets) {
+            const bool containsGround = std::any_of(net.pins().begin(), net.pins().end(), [](const std::shared_ptr<Pin>& pin) {
+                return pin && pin->type == PinType::Ground;
+                });
+            if (containsGround) groundNet = net.id();
+        }
+        if (groundNet < 0) {
+            groundNet = 0;
+            addMessageUnique("Ground reference missing. Net 0 assumed as virtual ground.");
+        }
+
+        AnalogSystem system(nets, groundNet);
+        auto netOf = [](const std::shared_ptr<Pin>& pin) { return pin ? pin->net : -1; };
+
+        for (const auto& component : document_->components()) {
+            if (auto source = std::dynamic_pointer_cast<DCVoltageSource>(component)) {
+                system.addDrivenVoltage(netOf(component->pinByName("POS")),
+                    netOf(component->pinByName("NEG")),
+                    source->voltage());
+            }
+            else if (auto resistor = std::dynamic_pointer_cast<Resistor>(component)) {
+                const double r = std::max(1e-6, resistor->resistance());
+                system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("B")), 1.0 / r);
+            }
+            else if (auto capacitor = std::dynamic_pointer_cast<Capacitor>(component)) {
+                if (capacitor->capacitance() > 0.0) {
+                    const int nA = netOf(component->pinByName("A"));
+                    const int nB = netOf(component->pinByName("B"));
+                    const double eqConductance = capacitor->capacitance() / dt_;
+                    const double pastV = capacitorVoltageHistory_[component->id()];
+
+                    system.addConductance(nA, nB, eqConductance);
+                    system.addToRhs(nA, eqConductance * pastV);
+                    system.addToRhs(nB, -eqConductance * pastV);
                 }
-
-                netVoltages_.assign(nets.size(), 0.0);
-                for (const auto& net : nets) {
-                    if (net.id() == groundNet) continue;
-                    const int varIndex = system.variable(net.id());
-                    if (varIndex >= 0) netVoltages_[net.id()] = solution[varIndex];
-                }
-
-                pinVoltages_.clear();
-                for (const auto& net : nets) {
-                    for (const auto& pin : net.pins()) {
-                        if (pin) pinVoltages_[pin.get()] = netVoltages_[net.id()];
-                    }
-                }
-
-                CircuitDocument* document_{ nullptr };
-                SimulationState state_{ SimulationState::Stopped };
-                double dt_{ 0.01 };
-                double time_{ 0.0 };
-                double accumulatorWall_{ 0.0 };
-                std::vector<double> netVoltages_;
-                std::unordered_map<const Pin*, double> pinVoltages_;
-
-                std::vector<std::string> messages_;
-
+            }
             else if (auto inductor = std::dynamic_pointer_cast<Inductor>(component)) {
                 if (inductor->inductance() > 0.0) {
                     const int nA = netOf(component->pinByName("A"));
@@ -2293,12 +2372,93 @@ private:
                 const double btnCond = button->pressed() ? 100.0 : 1e-9;
                 system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("B")), btnCond);
             }
-
+            else if (std::dynamic_pointer_cast<Ammeter>(component)) {
+                system.addConductance(netOf(component->pinByName("IN")), netOf(component->pinByName("OUT")), 1.0 / 1e-4);
+            }
             else if (std::dynamic_pointer_cast<LED>(component)) {
                 const double vDiff = voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("K"));
                 const double effectiveResistance = (vDiff > 1.8) ? 330.0 : 1e8;
                 system.addConductance(netOf(component->pinByName("A")), netOf(component->pinByName("K")), 1.0 / effectiveResistance);
             }
+        }
+
+        for (const auto& component : document_->components()) {
+            if (auto clock = std::dynamic_pointer_cast<ClockGenerator>(component)) {
+                system.addDrivenVoltage(netOf(component->pinByName("OUT")), groundNet,
+                    clock->output() ? 5.0 : 0.0);
+            }
+            else if (auto gate = std::dynamic_pointer_cast<LogicGate>(component); gate && gate->outputValid()) {
+                system.addDrivenVoltage(netOf(component->pinByName("OUT")), groundNet,
+                    gate->output() ? 5.0 : 0.0);
+            }
+            else if (auto flipFlop = std::dynamic_pointer_cast<DFlipFlop>(component); flipFlop && flipFlop->valid()) {
+                system.addDrivenVoltage(netOf(component->pinByName("Q")), groundNet,
+                    flipFlop->q() ? 5.0 : 0.0);
+                system.addDrivenVoltage(netOf(component->pinByName("QB")), groundNet,
+                    flipFlop->q() ? 0.0 : 5.0);
+            }
+            else if (auto adc = std::dynamic_pointer_cast<SimpleADC>(component)) {
+                for (int bit = 0; bit < adc->bits(); ++bit) {
+                    const bool isHigh = ((adc->outputCode() >> bit) & 1u) != 0;
+                    system.addDrivenVoltage(netOf(component->pinByName("D" + std::to_string(bit))), groundNet,
+                        isHigh ? 5.0 : 0.0);
+                }
+            }
+            else if (auto dac = std::dynamic_pointer_cast<SimpleDAC>(component)) {
+                system.addDrivenVoltage(netOf(component->pinByName("VOUT")), groundNet, dac->analogOutput());
+            }
+            else if (auto mcu = std::dynamic_pointer_cast<Microcontroller>(component)) {
+                for (char port : {'A', 'B'}) {
+                    for (int bit = 0; bit < 8; ++bit) {
+                        bool outHigh = false;
+                        if (!mcu->drivesPortBit(port, bit, outHigh)) continue;
+                        system.addDrivenVoltage(netOf(component->pinByName(Microcontroller::pinName(port, bit))),
+                            groundNet, outHigh ? 5.0 : 0.0);
+                    }
+                }
+            }
+            else if (auto keypad = std::dynamic_pointer_cast<Keypad>(component)) {
+                std::array<bool, 4> rowsActive{};
+                for (int i = 0; i < 4; ++i)
+                    rowsActive[i] = logicAtPin(component->pinByName("R" + std::to_string(i + 1))) == LogicState::Low;
+
+                for (int col = 0; col < 4; ++col) {
+                    const bool colActive = keypad->columnActive(col, rowsActive);
+                    system.addDrivenVoltage(netOf(component->pinByName("C" + std::to_string(col + 1))),
+                        groundNet, colActive ? 0.0 : 5.0);
+                }
+            }
+            else if (auto memory = std::dynamic_pointer_cast<ExternalMemory>(component); memory && memory->readActive()) {
+                for (int bit = 0; bit < 8; ++bit) {
+                    const bool dHigh = ((memory->readData() >> bit) & 1u) != 0;
+                    system.addDrivenVoltage(netOf(component->pinByName("D" + std::to_string(bit))), groundNet,
+                        dHigh ? 5.0 : 0.0);
+                }
+            }
+        }
+
+        const double pivotStabilizer = 1e-10;
+        system.regularize(pivotStabilizer);
+
+        std::vector<double> solution;
+        if (!solveLinearSystem(system.matrix, system.rhs, solution)) {
+            addMessageUnique("Convergence error: Matrix solver could not find a solution.");
+            return;
+        }
+
+        netVoltages_.assign(nets.size(), 0.0);
+        for (const auto& net : nets) {
+            if (net.id() == groundNet) continue;
+            const int varIndex = system.variable(net.id());
+            if (varIndex >= 0) netVoltages_[net.id()] = solution[varIndex];
+        }
+
+        pinVoltages_.clear();
+        for (const auto& net : nets) {
+            for (const auto& pin : net.pins()) {
+                if (pin) pinVoltages_[pin.get()] = netVoltages_[net.id()];
+            }
+        }
 
         for (const auto& component : document_->components()) {
             if (std::dynamic_pointer_cast<Capacitor>(component)) {
@@ -2310,10 +2470,37 @@ private:
                 inductorCurrentHistory_[component->id()] +=
                     dt_ / std::max(1e-9, inductor->inductance()) * vL;
             }
-
+            else if (std::dynamic_pointer_cast<Ammeter>(component)) {
+                ammeterCurrent_[component->id()] =
+                    (voltageAtPin(component->pinByName("IN")) - voltageAtPin(component->pinByName("OUT"))) / 1e-4;
+            }
+        }
+    }
     void updateConsumers() {
         for (const auto& component : document_->components()) {
             if (auto led = std::dynamic_pointer_cast<LED>(component)) led->setOn(voltageAtPin(component->pinByName("A")) - voltageAtPin(component->pinByName("K")) > kLedThreshold);
+            else if (auto probe = std::dynamic_pointer_cast<VoltageProbe>(component)) probe->setVoltage(voltageAtPin(component->pinByName("IN")));
+            else if (auto voltmeter = std::dynamic_pointer_cast<Voltmeter>(component)) voltmeter->setReading(voltageAtPin(component->pinByName("POS")) - voltageAtPin(component->pinByName("NEG")));
+            else if (auto ammeter = std::dynamic_pointer_cast<Ammeter>(component)) ammeter->setReading(ammeterCurrent_[component->id()]);
+            else if (auto scope = std::dynamic_pointer_cast<Oscilloscope>(component)) {
+                const double reference = voltageAtPin(component->pinByName("GND")); scope->pushSample(voltageAtPin(component->pinByName("CH1")) - reference, voltageAtPin(component->pinByName("CH2")) - reference, time_);
+            }
+            else if (auto display = std::dynamic_pointer_cast<SevenSegment>(component)) {
+                std::uint8_t mask = 0; for (int bit = 0; bit < 8; ++bit) if (logicAtPin(component->pinByName(bit == 7 ? "DP" : std::string(1, static_cast<char>('A' + bit)))) == LogicState::High) mask |= static_cast<std::uint8_t>(1u << bit); display->setMask(mask);
+            }
+            else if (auto lcd = std::dynamic_pointer_cast<LCD16x2>(component)) {
+                std::uint8_t data = 0; for (int bit = 0; bit < 8; ++bit) if (logicAtPin(component->pinByName("D" + std::to_string(bit))) == LogicState::High) data |= static_cast<std::uint8_t>(1u << bit);
+                lcd->tickBus(logicAtPin(component->pinByName("RS")) == LogicState::High, logicAtPin(component->pinByName("RW")) == LogicState::High,
+                    logicAtPin(component->pinByName("E")) == LogicState::High, data);
+            }
+            else if (auto memory = std::dynamic_pointer_cast<ExternalMemory>(component)) {
+                std::uint16_t address = 0; std::uint8_t data = 0;
+                for (int bit = 0; bit < 8; ++bit) { if (logicAtPin(component->pinByName("A" + std::to_string(bit))) == LogicState::High) address |= static_cast<std::uint16_t>(1u << bit); if (logicAtPin(component->pinByName("D" + std::to_string(bit))) == LogicState::High) data |= static_cast<std::uint8_t>(1u << bit); }
+                const bool readActive = logicAtPin(component->pinByName("RD")) == LogicState::Low; const bool writeActive = logicAtPin(component->pinByName("WR")) == LogicState::Low;
+                memory->setReadBus(address, readActive); if (writeActive) memory->write(address, data);
+            }
+        }
+    }
 
     void updateWireValues() {
         wireLogicValues_.clear();
@@ -2327,9 +2514,23 @@ private:
         if (std::find(messages_.begin(), messages_.end(), message) == messages_.end()) messages_.push_back(message);
     }
 
+    void tick() {
+        if (!document_) return;
+        messages_.clear(); document_->buildNetlist(); tickDigital(); solveAnalog(); updateConsumers(); updateWireValues();
+        for (const auto& warning : document_->runDRC()) addMessageUnique(warning);
+        time_ += dt_;
+    }
+
+    CircuitDocument* document_{ nullptr };
+    SimulationState state_{ SimulationState::Stopped };
+    double dt_{ 0.01 };
+    double time_{ 0.0 };
+    double accumulatorWall_{ 0.0 };
+    std::vector<double> netVoltages_;
+    std::unordered_map<const Pin*, double> pinVoltages_;
     std::unordered_map<ComponentId, double> capacitorVoltageHistory_;
     std::unordered_map<ComponentId, double> inductorCurrentHistory_;
+    std::unordered_map<ComponentId, double> ammeterCurrent_;
     std::unordered_map<WireId, int> wireLogicValues_;
-
-
-
+    std::vector<std::string> messages_;
+};
