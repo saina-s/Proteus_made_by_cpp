@@ -4050,3 +4050,184 @@ private:
         }
         if (button.button == SDL_BUTTON_LEFT && heldPushButton_) { heldPushButton_->setPressed(false); heldPushButton_.reset(); }
     }
+
+
+    void handleEditorMouseWheel(const SDL_MouseWheelEvent& wheel) {
+        int x, y; SDL_GetMouseState(&x, &y); mouseX_ = x; mouseY_ = y;
+        if (!pointInRect(x, y, canvasRect_)) {
+            if (pointInRect(x, y, libraryRect_)) libraryScroll_ = std::max(0, libraryScroll_ - wheel.y * 3);
+            else if (pointInRect(x, y, logRect_)) logScroll_ = std::max(0, logScroll_ - wheel.y * 3);
+            return;
+        }
+        const Vec2 world = camera_.screenToWorld({ static_cast<double>(x), static_cast<double>(y) });
+        if (auto pot = std::dynamic_pointer_cast<Potentiometer>(document_.componentAt(world))) {
+            history_.begin("Adjust potentiometer"); pot->adjustWiper(wheel.y * 0.02); history_.commit(); document_.setModified(true); return;
+        }
+        const Vec2 before = camera_.screenToWorld({ static_cast<double>(x), static_cast<double>(y) });
+        const double factor = wheel.y > 0 ? 1.12 : 1.0 / 1.12; camera_.zoom = clampValue(camera_.zoom * factor, 0.2, 4.0);
+        const Vec2 after = camera_.screenToWorld({ static_cast<double>(x), static_cast<double>(y) });
+        camera_.pan += (after - before) * camera_.zoom;
+    }
+
+    void beginComponentDrag(Vec2 world) {
+        draggingComponents_ = true; dragStartWorld_ = world; dragOriginalPositions_.clear();
+        for (ComponentId id : selectedComponents_) if (auto component = document_.componentById(id)) dragOriginalPositions_[id] = component->position();
+        history_.begin("Move component(s)");
+    }
+
+    void placeComponent(Vec2 world) {
+        auto component = createComponentByType(placeType_); if (!component) return;
+        history_.begin("Add " + placeType_); component->moveTo(snapToGrid(world)); document_.addComponent(component); history_.commit();
+        clearSelection(); selectedComponents_.insert(component->id()); notify(placeType_ + " placed");
+    }
+
+    void handleWireClick(Vec2 world) {
+        auto pin = document_.pinAt(world, 14.0 / camera_.zoom + 4.0);
+        if (!wireStart_) {
+            if (!pin) { notify("Start a wire by clicking a highlighted pin.", Palette::Warning); return; }
+            wireStart_ = pin; wireWaypoints_.clear(); wireCurrentWorld_ = pin->worldPosition; notify("Wire started; click bends or another pin."); return;
+        }
+        if (pin && pin != wireStart_) {
+            auto wire = std::make_shared<Wire>(); wire->setPins(wireStart_, pin); wire->setPath(Wire::orthogonalPath(wireStart_->worldPosition, wireWaypoints_, pin->worldPosition), !wireWaypoints_.empty());
+            history_.begin("Add wire"); if (document_.addWire(wire)) { history_.commit(); notify("Wire connected"); }
+            else { history_.cancel(); notify("Duplicate or invalid wire.", Palette::Warning); }
+            cancelWire(); return;
+        }
+        wireWaypoints_.push_back(snapToGrid(world)); wireCurrentWorld_ = snapToGrid(world);
+    }
+
+    void cancelWire() { wireStart_.reset(); wireWaypoints_.clear(); }
+
+    void handleLibraryClick(int x, int y, int clicks) {
+        (void)clicks;
+        SDL_Rect search{ libraryRect_.x + 10, libraryRect_.y + 34, libraryRect_.w - 20, 32 };
+        if (pointInRect(x, y, search)) { searchFocused_ = true; return; }
+        searchFocused_ = false;
+        int cursorY = libraryRect_.y + 78 - libraryScroll_ * 26;
+        const std::array<ComponentCategory, 7> categories{ {ComponentCategory::Sources, ComponentCategory::Passive, ComponentCategory::Interactive, ComponentCategory::Digital, ComponentCategory::Advanced, ComponentCategory::Peripheral, ComponentCategory::Measurement} };
+        for (ComponentCategory category : categories) {
+            std::vector<const LibraryEntry*> visible;
+            for (const auto& entry : componentLibrary()) if (entry.category == category && (searchText_.empty() || containsCaseInsensitive(entry.type, searchText_) || containsCaseInsensitive(categoryName(category), searchText_))) visible.push_back(&entry);
+            if (visible.empty()) continue;
+            SDL_Rect header{ libraryRect_.x + 8, cursorY, libraryRect_.w - 16, 25 };
+            if (pointInRect(x, y, header)) { categoryCollapsed_[category] = !categoryCollapsed_[category]; return; }
+            cursorY += 27;
+            if (!categoryCollapsed_[category]) for (const auto* entry : visible) {
+                SDL_Rect row{ libraryRect_.x + 16, cursorY, libraryRect_.w - 24, 24 };
+                if (pointInRect(x, y, row)) { selectedLibraryType_ = entry->type; placeType_ = entry->type; mode_ = EditorMode::Place; if (std::find(activeComponents_.begin(), activeComponents_.end(), entry->type) == activeComponents_.end()) activeComponents_.push_back(entry->type); return; }
+                cursorY += 25;
+            }
+        }
+        // Active device rows are at the bottom of the panel.
+        int activeY = libraryRect_.y + libraryRect_.h - 118;
+        for (std::size_t i = 0; i < activeComponents_.size() && i < 4; ++i) {
+            SDL_Rect row{ libraryRect_.x + 12, activeY + static_cast<int>(i) * 24, libraryRect_.w - 24, 22 };
+            if (pointInRect(x, y, row)) { selectedLibraryType_ = activeComponents_[i]; placeType_ = activeComponents_[i]; mode_ = EditorMode::Place; return; }
+        }
+    }
+
+    void handleLibraryRightClick(int x, int y) {
+        const int activeTop = libraryRect_.y + libraryRect_.h - 118;
+        for (std::size_t i = 0; i < activeComponents_.size() && i < 4; ++i) {
+            SDL_Rect row{ libraryRect_.x + 12, activeTop + static_cast<int>(i) * 24, libraryRect_.w - 24, 22 };
+            if (pointInRect(x, y, row)) {
+                if (selectedLibraryType_ == activeComponents_[i]) selectedLibraryType_.clear();
+                activeComponents_.erase(activeComponents_.begin() + static_cast<std::ptrdiff_t>(i));
+                notify("Removed from active devices");
+                return;
+            }
+        }
+    }
+
+    void handlePropertiesClick(int x, int y) {
+        auto component = singleSelectedComponent();
+        if (!component) return;
+        for (int i = 0; i < static_cast<int>(propertyRows_.size()); ++i) if (pointInRect(x, y, propertyRows_[i].rect) && !propertyRows_[i].descriptor.readOnly) {
+            propertyEditing_ = true; propertyEditIndex_ = i; propertyEditBuffer_ = propertyRows_[i].descriptor.value; return;
+        }
+        if (std::dynamic_pointer_cast<Microcontroller>(component)) {
+            SDL_Rect firmware{ propertiesRect_.x + 20, propertiesRect_.y + propertiesRect_.h - 100, propertiesRect_.w - 40, 34 };
+            if (pointInRect(x, y, firmware)) openFileDialog(FileOperation::LoadFirmware);
+        }
+        if (std::dynamic_pointer_cast<Oscilloscope>(component)) {
+            SDL_Rect scope{ propertiesRect_.x + 20, propertiesRect_.y + propertiesRect_.h - 58, propertiesRect_.w - 40, 34 };
+            if (pointInRect(x, y, scope)) modal_ = ModalKind::Scope;
+        }
+    }
+
+    void buildToolbarButtons() {
+        toolbarButtons_.clear(); int x = 8;
+        auto add = [&](std::string label, std::string action, bool enabled = true, bool active = false, int width = 62) {
+            toolbarButtons_.push_back({ UiButton{{x, 8, width, 32}, std::move(label), enabled, active}, std::move(action) }); x += width + 5;
+            };
+        add("New", "new"); add("Open", "open"); add("Save", "save"); add("Export", "export", true, false, 68);
+        x += 8; add("Undo", "undo", history_.canUndo()); add("Redo", "redo", history_.canRedo());
+        x += 8; add("Select", "select", true, mode_ == EditorMode::Select, 66); add("Wire", "wire", true, mode_ == EditorMode::Wire);
+        add("Junction", "junction", true, mode_ == EditorMode::Junction, 78); add("Probe", "probe", true, mode_ == EditorMode::Probe);
+        x += 8; add("Run", "run", true, simulation_.state() == SimulationState::Running); add("Pause", "pause", true, simulation_.state() == SimulationState::Paused);
+        add("Stop", "stop", true, simulation_.state() == SimulationState::Stopped); add("Step", "step"); add("DRC", "drc"); add("Help", "help");
+    }
+
+    void executeToolbarAction(const std::string& action) {
+        if (action == "new") { modal_ = ModalKind::NewProject; newProjectData_ = {}; }
+        else if (action == "open") openFileDialog(FileOperation::OpenProject);
+        else if (action == "save") { if (currentFile_.empty()) openFileDialog(FileOperation::SaveProject); else saveProject(currentFile_); }
+        else if (action == "export") openFileDialog(FileOperation::ExportImage);
+        else if (action == "undo") { std::string error; simulation_.pause(); if (!history_.undo(error) && !error.empty()) notify(error, Palette::Error); clearSelection(); }
+        else if (action == "redo") { std::string error; simulation_.pause(); if (!history_.redo(error) && !error.empty()) notify(error, Palette::Error); clearSelection(); }
+        else if (action == "select") { mode_ = EditorMode::Select; cancelWire(); }
+        else if (action == "wire") { mode_ = EditorMode::Wire; cancelWire(); }
+        else if (action == "junction") mode_ = EditorMode::Junction;
+        else if (action == "probe") mode_ = EditorMode::Probe;
+        else if (action == "run") simulation_.start();
+        else if (action == "pause") simulation_.pause();
+        else if (action == "stop") simulation_.stop();
+        else if (action == "step") simulation_.step();
+        else if (action == "drc") runDRC();
+        else if (action == "help") modal_ = ModalKind::Help;
+    }
+
+    void runDRC() {
+        logs_.clear(); const auto warnings = document_.runDRC();
+        if (warnings.empty()) appendLog("DRC check completed: zero design errors detected."); else for (const auto& warning : warnings) appendLog(warning);
+        notify(warnings.empty() ? "DRC passed" : (std::to_string(warnings.size()) + " DRC issue(s)"), warnings.empty() ? Palette::Accent2 : Palette::Warning);
+    }
+
+    void clearSelection() {
+        selectedComponents_.clear();
+        if (selectedWire_) if (auto wire = document_.wireById(*selectedWire_)) wire->setSelected(false);
+        if (selectedJunction_) for (const auto& junction : document_.junctions()) if (junction && junction->id() == *selectedJunction_) junction->setSelected(false);
+        selectedWire_.reset(); selectedJunction_.reset(); propertyEditing_ = false;
+    }
+
+    std::shared_ptr<Component> singleSelectedComponent() const {
+        return selectedComponents_.size() == 1 ? document_.componentById(*selectedComponents_.begin()) : nullptr;
+    }
+
+    void deleteSelection() {
+        if (selectedComponents_.empty() && !selectedWire_ && !selectedJunction_) return;
+        history_.begin("Delete selection");
+        std::vector<ComponentId> ids(selectedComponents_.begin(), selectedComponents_.end()); for (ComponentId id : ids) document_.removeComponent(id);
+        if (selectedWire_) document_.removeWire(*selectedWire_);
+        if (selectedJunction_) document_.removeJunction(*selectedJunction_);
+        history_.commit(); clearSelection(); notify("Selection deleted");
+    }
+
+    void transformSelection(const std::string& description, const std::function<void(Component&)>& transform) {
+        if (selectedComponents_.empty()) return;
+        history_.begin(description);
+        for (ComponentId id : selectedComponents_) if (auto component = document_.componentById(id)) transform(*component);
+        document_.rerouteConnectedWires(); document_.setModified(true); history_.commit();
+    }
+
+    void handleContextMenuClick(int x, int y) {
+        SDL_Rect menu{ contextMenuPosition_.x, contextMenuPosition_.y, 180, 148 };
+        if (!pointInRect(x, y, menu)) { contextMenuOpen_ = false; return; }
+        const int index = (y - menu.y) / 28;
+        if (index == 0) deleteSelection();
+        else if (index == 1) transformSelection("Rotate", [](Component& c) { c.rotate90(); });
+        else if (index == 2) transformSelection("Mirror horizontal", [](Component& c) { c.mirrorHorizontal(); });
+        else if (index == 3) transformSelection("Mirror vertical", [](Component& c) { c.mirrorVertical(); });
+        else if (index == 4) notify("Edit values in the Properties panel.");
+        contextMenuOpen_ = false;
+    }
