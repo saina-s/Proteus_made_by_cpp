@@ -63,40 +63,40 @@ struct Vec2 {
     Vec2() = default;
     Vec2(double px, double py) : x(px), y(py) {}
 
-    Vec2 operator+(const Vec2& rhs) const { 
-        return { x + rhs.x, y + rhs.y }; 
+    Vec2 operator+(const Vec2& rhs) const {
+        return { x + rhs.x, y + rhs.y };
     }
-    Vec2 operator-(const Vec2& rhs) const { 
-        return { x - rhs.x, y - rhs.y }; 
+    Vec2 operator-(const Vec2& rhs) const {
+        return { x - rhs.x, y - rhs.y };
     }
-    Vec2 operator*(double s) const { 
-        return { x * s, y * s }; 
+    Vec2 operator*(double s) const {
+        return { x * s, y * s };
     }
-    Vec2 operator/(double s) const { 
-        return { x / s, y / s }; 
+    Vec2 operator/(double s) const {
+        return { x / s, y / s };
     }
-    Vec2& operator+=(const Vec2& rhs) { 
-        x += rhs.x; y += rhs.y; return *this; 
+    Vec2& operator+=(const Vec2& rhs) {
+        x += rhs.x; y += rhs.y; return *this;
     }
-    Vec2& operator-=(const Vec2& rhs) { 
-        x -= rhs.x; y -= rhs.y; return *this; 
+    Vec2& operator-=(const Vec2& rhs) {
+        x -= rhs.x; y -= rhs.y; return *this;
     }
 };
 
-static double dot(const Vec2& a, const Vec2& b) { 
-    return a.x * b.x + a.y * b.y; 
+static double dot(const Vec2& a, const Vec2& b) {
+    return a.x * b.x + a.y * b.y;
 }
-static double lengthSquared(const Vec2& v) { 
-    return dot(v, v); 
+static double lengthSquared(const Vec2& v) {
+    return dot(v, v);
 }
-static double length(const Vec2& v) { 
-    return std::sqrt(lengthSquared(v)); 
+static double length(const Vec2& v) {
+    return std::sqrt(lengthSquared(v));
 }
-static double distance(const Vec2& a, const Vec2& b) { 
-    return length(a - b); 
+static double distance(const Vec2& a, const Vec2& b) {
+    return length(a - b);
 }
-static bool nearlyEqual(double a, double b, double eps = 1e-6) { 
-    return std::abs(a - b) <= eps; 
+static bool nearlyEqual(double a, double b, double eps = 1e-6) {
+    return std::abs(a - b) <= eps;
 }
 static bool nearlyEqual(const Vec2& a, const Vec2& b, double eps = 1e-6) {
     return nearlyEqual(a.x, b.x, eps) && nearlyEqual(a.y, b.y, eps);
@@ -117,20 +117,20 @@ struct RectD {
     double w{ 0.0 };
     double h{ 0.0 };
 
-    double left() const { 
-        return std::min(x, x + w); 
+    double left() const {
+        return std::min(x, x + w);
     }
-    double right() const { 
-        return std::max(x, x + w); 
+    double right() const {
+        return std::max(x, x + w);
     }
-    double top() const { 
-        return std::min(y, y + h); 
+    double top() const {
+        return std::min(y, y + h);
     }
-    double bottom() const { 
-        return std::max(y, y + h); 
+    double bottom() const {
+        return std::max(y, y + h);
     }
-    Vec2 center() const { 
-        return { (left() + right()) * 0.5, (top() + bottom()) * 0.5 }; 
+    Vec2 center() const {
+        return { (left() + right()) * 0.5, (top() + bottom()) * 0.5 };
     }
     bool contains(Vec2 p) const {
         return p.x >= left() && p.x <= right() && p.y >= top() && p.y <= bottom();
@@ -273,8 +273,8 @@ static void drawCircle(SDL_Renderer* renderer, int cx, int cy, int radius, Color
         if (err <= 0) {
             err += 2 * y + 1;
         }
-        if (err > 0) { 
-            --x; err -= 2 * x + 1; 
+        if (err > 0) {
+            --x; err -= 2 * x + 1;
         }
     }
 }
@@ -2482,58 +2482,7 @@ private:
     bool manualRoute_{ false };
 };
 
-void removeComponent(ComponentId id) {
-    std::unordered_set<const Pin*> removedPins;
-    for (const auto& c : components_) if (c && c->id() == id) for (const auto& pin : c->pins()) if (pin) removedPins.insert(pin.get());
-    wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [&](const std::shared_ptr<Wire>& wire) {
-        return !wire || (wire->startPin() && removedPins.count(wire->startPin().get())) || (wire->endPin() && removedPins.count(wire->endPin().get()));
-        }), wires_.end());
-    components_.erase(std::remove_if(components_.begin(), components_.end(), [id](const auto& c) { return !c || c->id() == id; }), components_.end());
-    pruneUnusedJunctions(); modified_ = true;
-}
 
-bool addWire(std::shared_ptr<Wire> wire) {
-    if (!wire || !wire->startPin() || !wire->endPin() || wire->startPin() == wire->endPin()) return false;
-    for (const auto& existing : wires_) {
-        if (!existing) continue;
-        const bool same = existing->startPin() == wire->startPin() && existing->endPin() == wire->endPin();
-        const bool reverse = existing->startPin() == wire->endPin() && existing->endPin() == wire->startPin();
-        if (same || reverse) return false;
-    }
-    if (wire->path().size() < 2) wire->routeSimple();
-    wires_.push_back(std::move(wire)); modified_ = true; return true;
-}
-
-void removeWire(WireId id) {
-    wires_.erase(std::remove_if(wires_.begin(), wires_.end(), [id](const auto& wire) { return !wire || wire->id() == id; }), wires_.end());
-    pruneUnusedJunctions(); modified_ = true;
-}
-
-
-std::shared_ptr<Wire> wireById(WireId id) const {
-    for (const auto& w : wires_) if (w && w->id() == id) return w;
-    return nullptr;
-}
-std::shared_ptr<Pin> pinByReference(ComponentId componentId, const std::string& pinName) const {
-    auto component = componentById(componentId); return component ? component->pinByName(pinName) : nullptr;
-}
-
-std::shared_ptr<Wire> wireAt(Vec2 world, double tolerance = 5.0) const {
-    for (auto it = wires_.rbegin(); it != wires_.rend(); ++it) if (*it && (*it)->hitTest(world, tolerance)) return *it;
-    return nullptr;
-}
-
-std::shared_ptr<Pin> pinAt(Vec2 world, double radius = kPinHoverRadius * 1.6) const {
-    std::shared_ptr<Pin> best; double bestDistance = radius;
-    for (const auto& component : components_) if (component) for (const auto& pin : component->pins()) if (pin) {
-        const double d = distance(world, pin->worldPosition); if (d <= bestDistance) { bestDistance = d; best = pin; }
-    }
-    return best;
-}
-
-void rerouteConnectedWires() {
-    for (auto& wire : wires_) if (wire) wire->reroutePreservingWaypoints();
-}
 
 class Junction {
 public:
@@ -3590,7 +3539,7 @@ public:
             std::cerr << "TTF_Init failed: " << TTF_GetError() << "\n"; return false;
         }
         window_ = SDL_CreateWindow("ProteusClone SDL2", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            1440, 900, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+            1280, 800, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
         if (!window_) { std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n"; return false; }
         renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC | SDL_RENDERER_TARGETTEXTURE);
         if (!renderer_) renderer_ = SDL_CreateRenderer(window_, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_TARGETTEXTURE);
@@ -4232,7 +4181,7 @@ private:
         contextMenuOpen_ = false;
     }
 
-// rendering entry points
+    // rendering entry points
 
     void render() {
         updateLayout(); setRenderColor(renderer_, Palette::Background); SDL_RenderClear(renderer_);
@@ -4569,7 +4518,7 @@ private:
     SDL_Renderer* renderer_{ nullptr };
     FontBook fonts_;
     std::unique_ptr<TextRenderer> text_;
-    int windowWidth_{ 1440 }, windowHeight_{ 900 };
+    int windowWidth_{ 1280 }, windowHeight_{ 800 };
     int mouseX_{ 0 }, mouseY_{ 0 };
 
     CircuitDocument document_;
@@ -4627,10 +4576,10 @@ private:
     FileDialogData fileDialog_;
 };
 
-#undef main
 int main(int argc, char** argv) {
     ProteusApp app;
     if (!app.initialize()) return 1;
     (void)argc; (void)argv;
     return app.run();
 }
+
