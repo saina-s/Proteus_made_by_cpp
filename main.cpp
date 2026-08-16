@@ -4558,3 +4558,79 @@ private:
         text_->draw("Time: " + formatDouble(scope->timePerDiv()) + " s/div   Auto memory: " + std::to_string(scope->maxSamples()) + " samples", box.x + 680, box.y + box.h - 82, Palette::Text, 11);
         text_->draw("Edit CH enable, V/div, offsets and Time/div in the Properties panel. Enter/Escape closes.", box.x + box.w / 2, box.y + box.h - 42, Palette::Muted, 12, 0, true);
     }
+
+
+
+    // State
+
+    struct Notification { std::string message; Color color; Uint32 created; };
+
+    SDL_Window* window_{ nullptr };
+    SDL_Renderer* renderer_{ nullptr };
+    FontBook fonts_;
+    std::unique_ptr<TextRenderer> text_;
+    int windowWidth_{ 1440 }, windowHeight_{ 900 };
+    int mouseX_{ 0 }, mouseY_{ 0 };
+
+    CircuitDocument document_;
+    SimulationEngine simulation_;
+    HistoryManager history_;
+    std::string currentFile_;
+    ScreenState screen_{ ScreenState::StartMenu };
+    ModalKind modal_{ ModalKind::None };
+    EditorMode mode_{ EditorMode::Select };
+
+    SDL_Rect toolbarRect_{}, libraryRect_{}, propertiesRect_{}, logRect_{}, canvasRect_{}, statusRect_{};
+    Camera camera_;
+    Vec2 lastMouseWorld_{ 0, 0 };
+
+    std::vector<std::pair<UiButton, std::string>> toolbarButtons_;
+    std::vector<RecentProject> recentProjects_;
+    std::deque<Notification> notifications_;
+    std::deque<std::string> logs_;
+    int logScroll_{ 0 };
+
+    std::string searchText_;
+    bool searchFocused_{ false };
+    int libraryScroll_{ 0 };
+    std::map<ComponentCategory, bool> categoryCollapsed_;
+    std::string selectedLibraryType_;
+    std::vector<std::string> activeComponents_;
+    std::string placeType_;
+
+    std::unordered_set<ComponentId> selectedComponents_;
+    std::optional<WireId> selectedWire_;
+    std::optional<JunctionId> selectedJunction_;
+    std::vector<PropertyRow> propertyRows_;
+    bool propertyEditing_{ false };
+    int propertyEditIndex_{ -1 };
+    std::string propertyEditBuffer_;
+
+    bool spaceHeld_{ false };
+    bool panning_{ false };
+    Vec2 panStartScreen_, panStartOffset_;
+    bool draggingComponents_{ false };
+    Vec2 dragStartWorld_;
+    std::unordered_map<ComponentId, Vec2> dragOriginalPositions_;
+    bool selectingRectangle_{ false };
+    Vec2 selectionStartWorld_, selectionEndWorld_;
+    std::shared_ptr<PushButton> heldPushButton_;
+
+    std::shared_ptr<Pin> wireStart_;
+    std::vector<Vec2> wireWaypoints_;
+    Vec2 wireCurrentWorld_;
+
+    bool contextMenuOpen_{ false };
+    SDL_Point contextMenuPosition_{ 0, 0 };
+
+    NewProjectData newProjectData_;
+    FileDialogData fileDialog_;
+};
+
+#undef main
+int main(int argc, char** argv) {
+    ProteusApp app;
+    if (!app.initialize()) return 1;
+    (void)argc; (void)argv;
+    return app.run();
+}
