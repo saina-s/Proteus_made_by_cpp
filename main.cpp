@@ -4231,3 +4231,330 @@ private:
         else if (index == 4) notify("Edit values in the Properties panel.");
         contextMenuOpen_ = false;
     }
+
+// rendering entry points
+
+    void render() {
+        updateLayout(); setRenderColor(renderer_, Palette::Background); SDL_RenderClear(renderer_);
+        if (screen_ == ScreenState::StartMenu) renderStartMenu(); else renderEditor();
+        renderNotifications(); renderModal(); SDL_RenderPresent(renderer_);
+    }
+
+    void renderStartMenu() {
+        fillRect(renderer_, { 0, 0, windowWidth_, windowHeight_ }, Color{ 255, 182, 193, 255 });
+        text_->draw("ProteusClone", windowWidth_ / 2, 105, Palette::Text, 42, 0, true);
+        text_->draw("SDL2 single-file schematic editor and hybrid simulator", windowWidth_ / 2, 165, Palette::Muted, 18, 0, true);
+        UiButton newButton{ {windowWidth_ / 2 - 210, 280, 200, 48}, "New Project", true, false };
+        UiButton openButton{ {windowWidth_ / 2 + 10, 280, 200, 48}, "Open Project", true, false };
+        drawButton(renderer_, *text_, newButton, mouseX_, mouseY_, 16); drawButton(renderer_, *text_, openButton, mouseX_, mouseY_, 16);
+        text_->draw("Recent Projects", windowWidth_ / 2 - 360, 355, Palette::Text, 19);
+        if (recentProjects_.empty()) text_->draw("No project history available", windowWidth_ / 2 - 360, 400, Palette::Muted, 14);
+        int y = 390;
+        for (const auto& recent : recentProjects_) {
+            SDL_Rect row{ windowWidth_ / 2 - 360, y, 720, 46 }; fillRect(renderer_, row, pointInRect(mouseX_, mouseY_, row) ? Palette::Panel2 : Palette::Panel); outlineRect(renderer_, row, Color{ 75, 82, 94, 255 });
+            text_->draw(fs::path(recent.path).filename().string(), row.x + 14, row.y + 7, Palette::Text, 14);
+            text_->draw(recent.path, row.x + 220, row.y + 7, Palette::Muted, 12, 370);
+            text_->draw(recent.timestamp, row.x + 580, row.y + 7, Palette::Muted, 12);
+            y += 52;
+        }
+        text_->draw("N: new  O: open  Q: quit", windowWidth_ / 2, windowHeight_ - 70, Palette::Muted, 13, 0, true);
+    }
+
+    void renderEditor() {
+        renderToolbar(); renderLibrary(); renderProperties(); renderLog(); renderCanvas(); renderStatus();
+        if (contextMenuOpen_) renderContextMenu();
+    }
+
+    void renderToolbar() {
+        fillRect(renderer_, toolbarRect_, Palette::Panel); buildToolbarButtons();
+        for (const auto& pair : toolbarButtons_) drawButton(renderer_, *text_, pair.first, mouseX_, mouseY_, 12);
+    }
+
+    void renderLibrary() {
+        fillRect(renderer_, libraryRect_, Palette::Panel); outlineRect(renderer_, libraryRect_, Color{ 70, 76, 88, 255 });
+        text_->draw("Component Library", libraryRect_.x + 12, libraryRect_.y + 8, Palette::Text, 16);
+        SDL_Rect search{ libraryRect_.x + 10, libraryRect_.y + 34, libraryRect_.w - 20, 32 };
+        fillRect(renderer_, search, Color{ 30, 34, 41, 255 }); outlineRect(renderer_, search, searchFocused_ ? Palette::Accent : Color{ 80, 87, 98, 255 });
+        text_->draw(searchText_.empty() ? "Search name or category..." : searchText_, search.x + 8, search.y + 7,
+            searchText_.empty() ? Palette::Muted : Palette::Text, 12);
+
+        const int previewTop = libraryRect_.y + libraryRect_.h - 238;
+        SDL_Rect listClip{ libraryRect_.x, libraryRect_.y + 70, libraryRect_.w, std::max(60, previewTop - (libraryRect_.y + 70)) };
+        SDL_RenderSetClipRect(renderer_, &listClip);
+        int cursorY = libraryRect_.y + 78 - libraryScroll_ * 26;
+        int visibleCount = 0;
+        const std::array<ComponentCategory, 7> categories{ {ComponentCategory::Sources, ComponentCategory::Passive, ComponentCategory::Interactive, ComponentCategory::Digital, ComponentCategory::Advanced, ComponentCategory::Peripheral, ComponentCategory::Measurement} };
+        for (ComponentCategory category : categories) {
+            std::vector<const LibraryEntry*> visible;
+            for (const auto& entry : componentLibrary()) if (entry.category == category &&
+                (searchText_.empty() || containsCaseInsensitive(entry.type, searchText_) || containsCaseInsensitive(categoryName(category), searchText_))) visible.push_back(&entry);
+            if (visible.empty()) continue;
+            ++visibleCount;
+            SDL_Rect header{ libraryRect_.x + 8, cursorY, libraryRect_.w - 16, 25 }; fillRect(renderer_, header, Color{ 50, 56, 67, 255 });
+            text_->draw(categoryCollapsed_[category] ? "> " + categoryName(category) : "v " + categoryName(category), header.x + 6, header.y + 5, Palette::Text, 12);
+            cursorY += 27;
+            if (!categoryCollapsed_[category]) for (const auto* entry : visible) {
+                ++visibleCount;
+                SDL_Rect row{ libraryRect_.x + 16, cursorY, libraryRect_.w - 24, 24 };
+                const bool selected = selectedLibraryType_ == entry->type;
+                if (selected || pointInRect(mouseX_, mouseY_, row)) fillRect(renderer_, row, selected ? Color{ 35, 115, 155, 255 } : Palette::Panel2);
+                text_->draw(entry->type, row.x + 5, row.y + 4, Palette::Text, 11); cursorY += 25;
+            }
+        }
+        if (visibleCount == 0) text_->draw("No components found", libraryRect_.x + 20, libraryRect_.y + 95, Palette::Warning, 12);
+        SDL_RenderSetClipRect(renderer_, nullptr);
+
+        SDL_Rect preview{ libraryRect_.x + 10, previewTop, libraryRect_.w - 20, 108 };
+        fillRect(renderer_, preview, Color{ 226, 228, 221, 255 }); outlineRect(renderer_, preview, Color{ 95, 100, 105, 255 });
+        text_->draw("Schematic preview", preview.x + 6, preview.y + 5, Palette::DarkText, 11);
+        if (!selectedLibraryType_.empty()) {
+            auto sample = createComponentByType(selectedLibraryType_);
+            if (sample) {
+                Camera previewCamera; previewCamera.viewport = { preview.x, preview.y + 18, preview.w, preview.h - 20 }; previewCamera.zoom = 0.75;
+                previewCamera.pan = { preview.w * 0.5, (preview.h - 20) * 0.5 }; sample->moveTo({ 0, 0 }); CanvasPainter painter(renderer_, text_.get(), &previewCamera); sample->draw(painter, false);
+                auto entry = std::find_if(componentLibrary().begin(), componentLibrary().end(), [&](const LibraryEntry& e) { return e.type == selectedLibraryType_; });
+                if (entry != componentLibrary().end()) text_->draw(entry->description, preview.x + 5, preview.y + 80, Palette::DarkText, 8, preview.w - 10);
+            }
+        }
+        else text_->draw("Select a component", preview.x + 10, preview.y + 44, Palette::Muted, 12);
+
+        const int activeTop = libraryRect_.y + libraryRect_.h - 118;
+        text_->draw("Active Devices (right-click to remove)", libraryRect_.x + 10, activeTop - 20, Palette::Text, 10);
+        for (std::size_t i = 0; i < activeComponents_.size() && i < 4; ++i) {
+            SDL_Rect row{ libraryRect_.x + 12, activeTop + static_cast<int>(i) * 24, libraryRect_.w - 24, 22 };
+            const bool selected = activeComponents_[i] == selectedLibraryType_;
+            fillRect(renderer_, row, selected ? Color{ 35, 115, 155, 255 } : Palette::Panel2); outlineRect(renderer_, row, Color{ 75, 82, 94, 255 });
+            text_->draw(activeComponents_[i], row.x + 6, row.y + 3, Palette::Text, 10);
+        }
+    }
+
+    void renderProperties() {
+        fillRect(renderer_, propertiesRect_, Palette::Panel); outlineRect(renderer_, propertiesRect_, Color{ 70, 76, 88, 255 });
+        text_->draw("Properties", propertiesRect_.x + 14, propertiesRect_.y + 10, Palette::Text, 17);
+        propertyRows_.clear();
+        auto component = singleSelectedComponent();
+        if (!component) {
+            text_->draw(selectedComponents_.size() > 1 ? std::to_string(selectedComponents_.size()) + " components selected" : "Select or double-click a component", propertiesRect_.x + 14, propertiesRect_.y + 48, Palette::Muted, 12, propertiesRect_.w - 28);
+            text_->draw("R: rotate  H/V: mirror  Delete: remove", propertiesRect_.x + 14, propertiesRect_.y + 90, Palette::Muted, 11, propertiesRect_.w - 28);
+            return;
+        }
+        text_->draw(component->type() + "  #" + std::to_string(component->id()), propertiesRect_.x + 14, propertiesRect_.y + 42, Palette::Accent, 13);
+        text_->draw("Position: " + std::to_string(static_cast<int>(component->position().x)) + ", " + std::to_string(static_cast<int>(component->position().y)) +
+            "  Rotation: " + std::to_string(component->rotation()), propertiesRect_.x + 14, propertiesRect_.y + 64, Palette::Muted, 10);
+        int y = propertiesRect_.y + 92;
+        const auto properties = component->properties();
+        for (int i = 0; i < static_cast<int>(properties.size()); ++i) {
+            const auto& descriptor = properties[i];
+            text_->draw(descriptor.label, propertiesRect_.x + 14, y, Palette::Muted, 10);
+            SDL_Rect field{ propertiesRect_.x + 14, y + 16, propertiesRect_.w - 28, 30 };
+            fillRect(renderer_, field, descriptor.readOnly ? Color{ 46, 49, 56, 255 } : Color{ 29, 33, 40, 255 });
+            outlineRect(renderer_, field, propertyEditing_ && propertyEditIndex_ == i ? Palette::Accent : Color{ 78, 85, 96, 255 });
+            const std::string value = propertyEditing_ && propertyEditIndex_ == i ? propertyEditBuffer_ : descriptor.value;
+            text_->draw(value, field.x + 7, field.y + 7, descriptor.readOnly ? Palette::Muted : Palette::Text, 11, field.w - 14);
+            propertyRows_.push_back({ descriptor, field }); y += 58;
+            if (y > propertiesRect_.y + propertiesRect_.h - 130) break;
+        }
+        if (std::dynamic_pointer_cast<Microcontroller>(component)) {
+            UiButton browse{ {propertiesRect_.x + 20, propertiesRect_.y + propertiesRect_.h - 100, propertiesRect_.w - 40, 34}, "Browse Intel HEX...", true, false };
+            drawButton(renderer_, *text_, browse, mouseX_, mouseY_, 11);
+        }
+        if (std::dynamic_pointer_cast<Oscilloscope>(component)) {
+            UiButton scope{ {propertiesRect_.x + 20, propertiesRect_.y + propertiesRect_.h - 58, propertiesRect_.w - 40, 34}, "Open full oscilloscope", true, false };
+            drawButton(renderer_, *text_, scope, mouseX_, mouseY_, 11);
+        }
+    }
+
+    void renderLog() {
+        fillRect(renderer_, logRect_, Color{ 27, 30, 36, 255 }); outlineRect(renderer_, logRect_, Color{ 70, 76, 88, 255 });
+        text_->draw("Simulation / DRC Log", logRect_.x + 10, logRect_.y + 7, Palette::Text, 13);
+        std::vector<std::string> all;
+        for (const auto& item : logs_) all.push_back(item);
+        if (simulation_.state() != SimulationState::Stopped) for (const auto& item : simulation_.messages()) if (std::find(all.begin(), all.end(), item) == all.end()) all.push_back(item);
+        const int visibleRows = std::max(1, (logRect_.h - 32) / 18);
+        const int start = std::max(0, static_cast<int>(all.size()) - visibleRows - logScroll_);
+        for (int i = 0; i < visibleRows && start + i < static_cast<int>(all.size()); ++i) {
+            const std::string& message = all[start + i];
+            Color color = containsCaseInsensitive(message, "short") || containsCaseInsensitive(message, "failed") ? Palette::Error :
+                (containsCaseInsensitive(message, "floating") || containsCaseInsensitive(message, "warning") ? Palette::Warning : Palette::Muted);
+            text_->draw(message, logRect_.x + 12, logRect_.y + 29 + i * 18, color, 10, logRect_.w - 24);
+        }
+    }
+
+    void renderCanvas() {
+        SDL_RenderSetClipRect(renderer_, &canvasRect_); renderCanvasContent(camera_, true, true);
+        CanvasPainter painter(renderer_, text_.get(), &camera_);
+        if (mode_ == EditorMode::Place && !placeType_.empty()) {
+            auto ghost = createComponentByType(placeType_); if (ghost) { ghost->moveTo(snapToGrid(lastMouseWorld_)); ghost->draw(painter, true); }
+        }
+        if (wireStart_) {
+            const auto preview = Wire::orthogonalPath(wireStart_->worldPosition, wireWaypoints_, wireCurrentWorld_); painter.polyline(preview, Palette::Accent, 2);
+        }
+        if (selectingRectangle_) {
+            RectD r = normalizedRect(selectionStartWorld_, selectionEndWorld_); Vec2 a = camera_.worldToScreen({ r.left(), r.top() }), b = camera_.worldToScreen({ r.right(), r.bottom() });
+            SDL_Rect sr{ static_cast<int>(a.x), static_cast<int>(a.y), static_cast<int>(b.x - a.x), static_cast<int>(b.y - a.y) }; drawDashedRect(renderer_, sr, Palette::Selection);
+        }
+        SDL_RenderSetClipRect(renderer_, nullptr);
+    }
+
+    void renderCanvasContent(const Camera& camera, bool grid, bool showSelection) {
+        fillRect(renderer_, camera.viewport, Palette::Canvas);
+        CanvasPainter painter(renderer_, text_.get(), &camera);
+        if (grid) {
+            const Vec2 topLeft = camera.screenToWorld({ static_cast<double>(camera.viewport.x), static_cast<double>(camera.viewport.y) });
+            const Vec2 bottomRight = camera.screenToWorld({ static_cast<double>(camera.viewport.x + camera.viewport.w), static_cast<double>(camera.viewport.y + camera.viewport.h) });
+            const int firstX = static_cast<int>(std::floor(topLeft.x / kGridSize)); const int lastX = static_cast<int>(std::ceil(bottomRight.x / kGridSize));
+            const int firstY = static_cast<int>(std::floor(topLeft.y / kGridSize)); const int lastY = static_cast<int>(std::ceil(bottomRight.y / kGridSize));
+            for (int gx = firstX; gx <= lastX; ++gx) {
+                const Color c = gx % 5 == 0 ? Palette::GridMajor : Palette::GridMinor;
+                painter.line({ gx * kGridSize, topLeft.y }, { gx * kGridSize, bottomRight.y }, c, 1);
+            }
+            for (int gy = firstY; gy <= lastY; ++gy) {
+                const Color c = gy % 5 == 0 ? Palette::GridMajor : Palette::GridMinor;
+                painter.line({ topLeft.x, gy * kGridSize }, { bottomRight.x, gy * kGridSize }, c, 1);
+            }
+        }
+        painter.rect({ 0, 0, static_cast<double>(document_.canvasWidth()), static_cast<double>(document_.canvasHeight()) }, Color{ 70, 75, 80, 255 }, false);
+        painter.line({ -12, 0 }, { 12, 0 }, Palette::Error, 2); painter.line({ 0, -12 }, { 0, 12 }, Palette::Error, 2); painter.textWorld("(0,0)", { 25, 5 }, Palette::Error, 9, false);
+
+        for (const auto& wire : document_.wires()) if (wire) {
+            Color color = Palette::WireAnalog;
+            if (simulation_.state() != SimulationState::Stopped) {
+                auto it = simulation_.wireLogicValues().find(wire->id()); const int value = it == simulation_.wireLogicValues().end() ? -1 : it->second;
+                color = value == 1 ? Palette::WireHigh : (value == 0 ? Palette::WireLow : Palette::WireFloat);
+            }
+            if (wire->selected() && showSelection) color = Palette::Selection;
+            painter.polyline(wire->path(), color, wire->selected() ? 3 : 2);
+        }
+        for (const auto& junction : document_.junctions()) if (junction) painter.circle(junction->position(), 4.0, junction->selected() && showSelection ? Palette::Selection : Color{ 30, 120, 55, 255 }, true);
+        for (const auto& component : document_.components()) if (component) component->draw(painter, showSelection && selectedComponents_.count(component->id()) != 0);
+    }
+
+    void renderStatus() {
+        fillRect(renderer_, statusRect_, Color{ 31, 35, 42, 255 });
+        const char* modeName = mode_ == EditorMode::Select ? "SELECT" : mode_ == EditorMode::Place ? "PLACE" : mode_ == EditorMode::Wire ? "WIRE" : mode_ == EditorMode::Junction ? "JUNCTION" : "PROBE";
+        std::string sim = simulation_.state() == SimulationState::Running ? "RUNNING" : simulation_.state() == SimulationState::Paused ? "PAUSED" : "STOPPED";
+        text_->draw(std::string("Mode: ") + modeName + "   Simulation: " + sim + "   Zoom: " + std::to_string(static_cast<int>(camera_.zoom * 100)) + "%",
+            statusRect_.x + 10, statusRect_.y + 5, Palette::Text, 10);
+        text_->draw("Mouse: (" + std::to_string(static_cast<int>(lastMouseWorld_.x)) + ", " + std::to_string(static_cast<int>(lastMouseWorld_.y)) + ")",
+            statusRect_.x + statusRect_.w - 190, statusRect_.y + 5, Palette::Text, 10);
+    }
+
+    void renderContextMenu() {
+        SDL_Rect menu{ contextMenuPosition_.x, contextMenuPosition_.y, 180, 148 }; fillRect(renderer_, menu, Palette::Panel); outlineRect(renderer_, menu, Palette::Accent);
+        const std::array<std::string, 5> items{ {"Delete", "Rotate 90 deg", "Mirror horizontal", "Mirror vertical", "Properties"} };
+        for (int i = 0; i < 5; ++i) { SDL_Rect row{ menu.x + 2, menu.y + 2 + i * 28, menu.w - 4, 27 }; if (pointInRect(mouseX_, mouseY_, row)) fillRect(renderer_, row, Palette::Panel2); text_->draw(items[i], row.x + 8, row.y + 6, Palette::Text, 11); }
+    }
+
+    void renderNotifications() {
+        const Uint32 now = SDL_GetTicks();
+        while (!notifications_.empty() && now - notifications_.back().created > 3500) notifications_.pop_back();
+        int y = 58;
+        for (const auto& notification : notifications_) {
+            auto [w, h] = text_->measure(notification.message, 12);
+            SDL_Rect box{ windowWidth_ - w - 34, y, w + 24, h + 14 }; fillRect(renderer_, box, Color{ 25, 29, 35, 235 }); outlineRect(renderer_, box, notification.color);
+            text_->draw(notification.message, box.x + 12, box.y + 7, notification.color, 12); y += box.h + 8;
+        }
+    }
+
+    void renderModal() {
+        if (modal_ == ModalKind::None) return;
+        fillRect(renderer_, { 0, 0, windowWidth_, windowHeight_ }, Color{ 0, 0, 0, 150 });
+        if (modal_ == ModalKind::NewProject) renderNewProjectModal();
+        else if (modal_ == ModalKind::FileDialog) renderFileDialogModal();
+        else if (modal_ == ModalKind::Help) renderHelpModal();
+        else if (modal_ == ModalKind::About) renderAboutModal();
+        else if (modal_ == ModalKind::Scope) renderScopeModal();
+    }
+
+    void renderNewProjectModal() {
+        const int cx = windowWidth_ / 2, cy = windowHeight_ / 2;
+        SDL_Rect box{ cx - 240, cy - 180, 480, 340 }; fillRect(renderer_, box, Palette::Panel); outlineRect(renderer_, box, Palette::Accent);
+        text_->draw("Create New Project", box.x + 20, box.y + 18, Palette::Text, 20);
+        auto field = [&](SDL_Rect rect, const std::string& label, const std::string& value, int index) {
+            text_->draw(label, rect.x, rect.y - 18, Palette::Muted, 11);
+            fillRect(renderer_, rect, Color{ 28, 32, 39, 255 });
+            outlineRect(renderer_, rect, newProjectData_.activeField == index ? Palette::Accent : Color{ 80, 87, 98, 255 });
+            text_->draw(value, rect.x + 8, rect.y + 8, Color{ 255, 255, 255, 255 }, 12);
+            };
+        field({ cx - 200, cy - 100, 400, 34 }, "Project name", newProjectData_.name, 0);
+        field({ cx - 200, cy - 52, 190, 34 }, "Canvas width", newProjectData_.width, 1);
+        field({ cx + 10, cy - 52, 190, 34 }, "Canvas height", newProjectData_.height, 2);
+        UiButton a4{ {cx - 200, cy + 4, 120, 34}, "A4 preset", true, false }; UiButton a3{ {cx - 65, cy + 4, 120, 34}, "A3 preset", true, false }; UiButton hd{ {cx + 70, cy + 4, 130, 34}, "1920 x 1080", true, false };
+        drawButton(renderer_, *text_, a4, mouseX_, mouseY_, 11); drawButton(renderer_, *text_, a3, mouseX_, mouseY_, 11); drawButton(renderer_, *text_, hd, mouseX_, mouseY_, 11);
+        UiButton cancel{ {cx - 200, cy + 65, 180, 42}, "Cancel", true, false }; UiButton create{ {cx + 20, cy + 65, 180, 42}, "Create", true, true };
+        drawButton(renderer_, *text_, cancel, mouseX_, mouseY_, 13); drawButton(renderer_, *text_, create, mouseX_, mouseY_, 13);
+    }
+    void renderFileDialogModal() {
+        const int cx = windowWidth_ / 2, cy = windowHeight_ / 2;
+        SDL_Rect box{ cx - 400, cy - 300, 800, 600 }; fillRect(renderer_, box, Palette::Panel); outlineRect(renderer_, box, Palette::Accent);
+        std::string title = fileDialog_.operation == FileOperation::OpenProject ? "Open Project" : fileDialog_.operation == FileOperation::SaveProject ? "Save Project" : fileDialog_.operation == FileOperation::ExportImage ? "Export Canvas as BMP" : "Load Intel HEX Firmware";
+        text_->draw(title, box.x + 20, box.y + 18, Palette::Text, 20);
+        text_->draw(fileDialog_.directory.string(), box.x + 20, box.y + 52, Palette::Muted, 11, box.w - 40);
+        SDL_Rect pathField{ cx - 360, cy - 255, 720, 34 }; fillRect(renderer_, pathField, Color{ 28, 32, 39, 255 }); outlineRect(renderer_, pathField, fileDialog_.editingPath ? Palette::Accent : Color{ 80, 87, 98, 255 });
+        text_->draw(fileDialog_.pathText.empty() ? "File name or full path" : fileDialog_.pathText, pathField.x + 8, pathField.y + 8, fileDialog_.pathText.empty() ? Palette::Muted : Palette::Text, 11, pathField.w - 16);
+        UiButton up{ {cx - 360, cy - 210, 80, 30}, "Up", fileDialog_.directory.has_parent_path(), false }; drawButton(renderer_, *text_, up, mouseX_, mouseY_, 11);
+        int y = cy - 170;
+        for (int row = 0; row < 12; ++row, y += 32) {
+            const int index = fileDialog_.scroll + row; if (index >= static_cast<int>(fileDialog_.entries.size())) break;
+            SDL_Rect r{ cx - 360, y, 720, 30 };
+            const bool selected = index == fileDialog_.selected; fillRect(renderer_, r, selected ? Color{ 35, 115, 155, 255 } : (pointInRect(mouseX_, mouseY_, r) ? Palette::Panel2 : Color{ 41, 45, 53, 255 }));
+            const auto& entry = fileDialog_.entries[index]; text_->draw(entry.is_directory() ? "[DIR]" : "[FILE]", r.x + 6, r.y + 7, entry.is_directory() ? Palette::Accent2 : Palette::Muted, 10);
+            text_->draw(entry.path().filename().string(), r.x + 65, r.y + 6, Palette::Text, 11, r.w - 75);
+        }
+        UiButton cancel{ {cx - 360, cy + 225, 180, 40}, "Cancel", true, false }; UiButton confirm{ {cx + 180, cy + 225, 180, 40}, "Confirm", true, true };
+        drawButton(renderer_, *text_, cancel, mouseX_, mouseY_, 13); drawButton(renderer_, *text_, confirm, mouseX_, mouseY_, 13);
+    }
+
+    void renderHelpModal() {
+        SDL_Rect box{ windowWidth_ / 2 - 410, 60, 820, windowHeight_ - 120 }; fillRect(renderer_, box, Palette::Panel); outlineRect(renderer_, box, Palette::Accent);
+        text_->draw("ProteusClone SDL2 - User Guide", box.x + 24, box.y + 20, Palette::Text, 22);
+        const std::string guide =
+            "PROJECT: Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+E export BMP. The start menu keeps five recent projects.\n\n"
+            "CANVAS: Mouse wheel zooms around the cursor. Middle-drag or Space+left-drag pans. The status bar shows coordinates and zoom. All placements and moves snap to the grid.\n\n"
+            "COMPONENTS: Choose a categorized/searchable library item to enter placement mode. Click the canvas to create instances. Click to select; drag empty canvas for multi-select. Drag selected components to move. R rotates, H/V mirror, Delete removes. Double-click/select and edit dynamic fields in Properties.\n\n"
+            "WIRES: W enters wire mode. Click a highlighted pin, click any number of 90-degree bend points, then click another pin. Right-click/Escape cancels. J places an explicit junction at a crossing; crossings without dots are not connected. Connected wires reroute while components move.\n\n"
+            "SIMULATION: F5 Run, F6 Pause, F7 Stop, F8 Step. Wire colors: red HIGH, blue LOW, gray floating/undefined. Switches toggle on click; push buttons remain active while held. Mouse wheel over a potentiometer adjusts its wiper.\n\n"
+            "TOOLS: P is a quick voltage probe. G runs DRC. Measurement components include probe, voltmeter, ammeter and a two-channel oscilloscope. Select an oscilloscope and press O for the full plot.\n\n"
+            "ADVANCED: ADC/DAC bit width and delays are editable. The MCU loads Intel HEX and executes the educational MOV/ADD/JMP/SETB/CLR bytecode. LCD, keypad and external RAM are live bus models.\n\n"
+            "UNDO/REDO: Ctrl+Z / Ctrl+Y. Right-click a selected object for a context menu.";
+        text_->draw(guide, box.x + 24, box.y + 64, Palette::Text, 13, box.w - 48);
+        text_->draw("Press Enter or Escape to close", box.x + box.w / 2, box.y + box.h - 34, Palette::Muted, 12, 0, true);
+    }
+
+    void renderAboutModal() {
+        SDL_Rect box{ windowWidth_ / 2 - 280, windowHeight_ / 2 - 170, 560, 340 }; fillRect(renderer_, box, Palette::Panel); outlineRect(renderer_, box, Palette::Accent);
+        text_->draw("ProteusClone SDL2", box.x + box.w / 2, box.y + 35, Palette::Text, 28, 0, true);
+        text_->draw("One C++17 translation unit", box.x + box.w / 2, box.y + 85, Palette::Accent, 16, 0, true);
+        text_->draw("Object-oriented schematic editor, digital simulator, backward-Euler analog solver, project persistence, undo/redo, DRC and measurement tools.", box.x + 35, box.y + 125, Palette::Text, 13, box.w - 70);
+        text_->draw("Graphics: SDL2 + SDL2_ttf", box.x + box.w / 2, box.y + 250, Palette::Muted, 13, 0, true);
+    }
+
+    void renderScopeModal() {
+        auto scope = std::dynamic_pointer_cast<Oscilloscope>(singleSelectedComponent());
+        SDL_Rect box{ windowWidth_ / 2 - 500, 55, 1000, windowHeight_ - 110 }; fillRect(renderer_, box, Color{ 18, 22, 21, 255 }); outlineRect(renderer_, box, Palette::Accent);
+        text_->draw("Two-Channel Oscilloscope", box.x + 22, box.y + 16, Palette::Text, 21);
+        if (!scope) { text_->draw("Select one Oscilloscope component before opening this panel.", box.x + 30, box.y + 90, Palette::Warning, 15); return; }
+        SDL_Rect plot{ box.x + 45, box.y + 70, box.w - 90, box.h - 170 }; fillRect(renderer_, plot, Color{ 8, 18, 10, 255 }); outlineRect(renderer_, plot, Color{ 85, 145, 90, 255 });
+        setRenderColor(renderer_, Color{ 30, 70, 35, 255 }); for (int i = 1; i < 10; ++i) { const int x = plot.x + i * plot.w / 10; SDL_RenderDrawLine(renderer_, x, plot.y, x, plot.y + plot.h); }
+        for (int i = 1; i < 8; ++i) { const int y = plot.y + i * plot.h / 8; SDL_RenderDrawLine(renderer_, plot.x, y, plot.x + plot.w, y); }
+        auto drawTrace = [&](const std::deque<double>& samples, double vdiv, double offset, Color color) {
+            if (samples.size() < 2) return;
+            setRenderColor(renderer_, color);
+            const std::size_t n = samples.size();
+            const double visibleSeconds = scope->timePerDiv() * 10.0; std::size_t count = std::min<std::size_t>(n, static_cast<std::size_t>(std::ceil(visibleSeconds / simulation_.timeStep())) + 2); const std::size_t start = n - count;
+            int previousX = plot.x, previousY = plot.y + plot.h / 2;
+            for (std::size_t i = start; i < n; ++i) {
+                const int x = plot.x + static_cast<int>((i - start) * (plot.w - 1) / std::max<std::size_t>(1, count - 1));
+                const double normalized = (samples[i] + offset) / (vdiv * 4.0); const int y = clampValue(static_cast<int>(std::lround(plot.y + plot.h / 2.0 - normalized * plot.h / 2.0)), plot.y, plot.y + plot.h);
+                if (i > start) drawThickLine(renderer_, previousX, previousY, x, y, 2, color);
+                previousX = x;
+                previousY = y;
+            }
+            };
+        if (scope->ch1Enabled()) drawTrace(scope->ch1Samples(), scope->ch1VoltsPerDiv(), scope->ch1Offset(), Color{ 35, 255, 80, 255 });
+        if (scope->ch2Enabled()) drawTrace(scope->ch2Samples(), scope->ch2VoltsPerDiv(), scope->ch2Offset(), Color{ 255, 210, 25, 255 });
+        text_->draw("CH1: " + formatDouble(scope->ch1VoltsPerDiv()) + " V/div, offset " + formatDouble(scope->ch1Offset()), box.x + 45, box.y + box.h - 82, Color{ 35, 255, 80, 255 }, 12);
+        text_->draw("CH2: " + formatDouble(scope->ch2VoltsPerDiv()) + " V/div, offset " + formatDouble(scope->ch2Offset()), box.x + 360, box.y + box.h - 82, Color{ 255, 210, 25, 255 }, 12);
+        text_->draw("Time: " + formatDouble(scope->timePerDiv()) + " s/div   Auto memory: " + std::to_string(scope->maxSamples()) + " samples", box.x + 680, box.y + box.h - 82, Palette::Text, 11);
+        text_->draw("Edit CH enable, V/div, offsets and Time/div in the Properties panel. Enter/Escape closes.", box.x + box.w / 2, box.y + box.h - 42, Palette::Muted, 12, 0, true);
+    }
