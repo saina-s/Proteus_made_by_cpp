@@ -214,6 +214,3 @@ Inheritance and polymorphism are used for the different circuit components, whil
 * **Saina Soltani** — Backend, circuit simulation, component logic, MCU and advanced components
 * **Farnoosh Chogani** — Frontend, SDL2 graphics, UI, event handling and user interactions
 
-## Note
-
-This is an educational project and not a full replacement for Proteus or a professional SPICE simulator. Some electrical models are simplified according to the scope of the course project.
